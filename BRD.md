@@ -1,13 +1,14 @@
 # Business Requirements Document
 ## PEAD Scanner — Indian Stock Market Earnings Signal System
 
-**Version:** 1.2
+**Version:** 1.3
 **Owner:** Aryan Agarwal
 **Repository:** https://github.com/AryanAgarwal27/pead-scanner
-**Status:** Draft for Implementation
+**Status:** Phase 1 complete; Phase 2 pending
 **Target Stack:** Python 3.11+, GitHub Actions, Supabase (Postgres), Telegram Bot API, Gemini API (free tier)
 
 **Changelog:**
+- v1.3 — Corrected job schedule: poll-filings extended to 20:30 IST (Indian results are filed mostly post-close, not during market hours); enrich/signal jobs shifted to 8:30/8:45 PM IST after result-filing window closes
 - v1.2 — Added repository URL, Phase 0 bootstrap, explicit first-prompt instructions for Claude Code
 - v1.1 — Added LLM-based filing parser (Gemini), signal tiering with confirmation checklist, position sizing tiers
 - v1.0 — Initial draft
@@ -261,9 +262,9 @@ Flags appear in the daily summary; user makes the final call.
 
 | Job | Cron (UTC) | Frequency | Purpose |
 |---|---|---|---|
-| `poll-filings` | `*/15 3-11 * * 1-5` | Every 15 min, market days | Detect new filings, send Day-0 alerts |
-| `enrich-eod` | `0 12 * * 1-5` | 5:30 PM IST | Compute metrics for today's filings |
-| `generate-signals` | `15 12 * * 1-5` | 5:45 PM IST | Rank top 25, send signal messages |
+| `poll-filings` | `*/15 3-14 * * 1-5` | Every 15 min, 08:30–20:30 IST, market days | Detect new filings, send Day-0 alerts (covers pre-open through post-close filing window) |
+| `enrich-eod` | `0 15 * * 1-5` | 8:30 PM IST | Compute metrics for today's filings (after the result-filing window closes) |
+| `generate-signals` | `15 15 * * 1-5` | 8:45 PM IST | Rank top 25, send signal messages |
 | `track-positions` | `30 10 * * 1-5` | 4:00 PM IST | Update open positions, daily summary |
 | `heartbeat` | `30 3 * * 1-5` | 9:00 AM IST | Source health check |
 | `screener-cache` | `0 18 * * *` | 11:30 PM IST daily | Refresh fundamentals cache |
