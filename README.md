@@ -12,7 +12,19 @@ See [BRD.md](BRD.md) for goals, architecture, data model, and phased delivery pl
 
 ## Current phase
 
-Phase 0 — repository bootstrap. No data pipeline is wired up yet.
+Phase 1 — BSE Day-0 alerts. Every 15 minutes during market hours (Mon–Fri, 03:00–11:59 UTC ≈ 08:30–17:29 IST) the [poll-filings workflow](.github/workflows/poll-filings.yml) hits the BSE result-category announcement API, derives the reporting quarter, upserts into Supabase, and sends a Telegram alert for each new filing (or a batched summary if >10 land in one poll).
+
+NSE / Trendlyne failover, enrichment, scoring, and signal generation are deferred to later phases.
+
+### Manual run
+
+```bash
+# Polls today (IST) by default:
+python jobs/poll_filings.py
+
+# Replay a past trading day for testing:
+python jobs/poll_filings.py --date 2026-05-23
+```
 
 ## How to run locally
 

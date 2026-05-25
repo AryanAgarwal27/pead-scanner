@@ -34,7 +34,13 @@ GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
 # ---------------------------------------------------------------------------
 # Source failover order (BRD §3.1, §5.1).
 # ---------------------------------------------------------------------------
-SOURCES_ORDER = ["NSE", "BSE", "TRENDLYNE"]  # TODO: phase 1/2
+SOURCES_ORDER = ["NSE", "BSE", "TRENDLYNE"]  # TODO: phase 2 (Phase 1 hard-codes BSE only)
+
+
+# ---------------------------------------------------------------------------
+# Day-0 polling (Phase 1, BRD §3.2 FR-2.4).
+# ---------------------------------------------------------------------------
+POLL_BATCH_THRESHOLD = 10  # if >N new filings land in one poll, condense to a batched message
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,49 @@
+{
+  "_note": "Synthesized BSE-style response for unit tests. Structure mirrors api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w with strCat=Result.",
+  "Table": [
+    {
+      "SCRIP_CD": 500180,
+      "SLONGNAME": "HDFC Bank Ltd",
+      "HEADLINE": "Standalone Financial Results for the Quarter Ended December 31, 2025",
+      "MORE": "Pursuant to Regulation 33 of SEBI LODR, please find attached the standalone financial results.",
+      "ATTACHMENTNAME": "abc123-def-456.pdf",
+      "NEWS_SUBMISSION_DT": "2026-01-25 18:23:00.000",
+      "DT_TM": "2026-01-25 18:23:00.000",
+      "NEWSSUB": "Result",
+      "CATEGORYNAME": "Result"
+    },
+    {
+      "SCRIP_CD": 500325,
+      "SLONGNAME": "Reliance Industries Ltd",
+      "HEADLINE": "Consolidated Financial Results for the Quarter and Year Ended March 31, 2026",
+      "MORE": "Audited consolidated financial results.",
+      "ATTACHMENTNAME": "ril-q4-fy26.pdf",
+      "NEWS_SUBMISSION_DT": "2026-04-22 16:45:30.000",
+      "DT_TM": "2026-04-22 16:45:30.000",
+      "NEWSSUB": "Result",
+      "CATEGORYNAME": "Result"
+    },
+    {
+      "SCRIP_CD": 532540,
+      "SLONGNAME": "Tata Consultancy Services Ltd",
+      "HEADLINE": "Outcome of Board Meeting - Audited Financial Results for the Quarter ended 31/12/2025",
+      "MORE": "",
+      "ATTACHMENTNAME": "tcs-q3.pdf",
+      "NEWS_SUBMISSION_DT": "2026-01-13 14:05:00.000",
+      "DT_TM": "2026-01-13 14:05:00.000",
+      "NEWSSUB": "Result",
+      "CATEGORYNAME": "Result"
+    },
+    {
+      "SCRIP_CD": 999999,
+      "SLONGNAME": "Some Holding Co Ltd",
+      "HEADLINE": "Annual Report for the year ended 31-Mar-2025",
+      "MORE": "",
+      "ATTACHMENTNAME": "annual.pdf",
+      "NEWS_SUBMISSION_DT": "2026-05-10 12:00:00.000",
+      "DT_TM": "2026-05-10 12:00:00.000",
+      "NEWSSUB": "Result",
+      "CATEGORYNAME": "Result"
+    }
+  ]
+}

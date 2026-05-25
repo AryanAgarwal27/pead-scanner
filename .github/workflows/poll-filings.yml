@@ -1,0 +1,38 @@
+name: poll-filings
+
+on:
+  schedule:
+    # BRD §5.2: every 15 min, 03:00–11:59 UTC, Mon–Fri.
+    # 03:00 UTC = 08:30 IST (45 min before market open).
+    # 11:45 UTC = 17:15 IST (last fire, covers post-close filings).
+    - cron: '*/15 3-11 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: poll-filings
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Poll
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+        run: python jobs/poll_filings.py
