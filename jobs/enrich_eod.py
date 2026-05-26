@@ -35,12 +35,22 @@ def main() -> int:
         action="store_true",
         help="Parse + compute but don't write to filings/metrics tables.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Process only the first N pending filings (oldest-first). "
+            "Use for incremental backfill validation before committing to a full run. "
+            "Default: process all."
+        ),
+    )
     args = parser.parse_args()
 
     db = get_client()
-    log.info(f"enrich-eod starting (dry_run={args.dry_run})")
+    log.info(f"enrich-eod starting (dry_run={args.dry_run}, limit={args.limit})")
 
-    outcomes = enrich_pending(db, dry_run=args.dry_run)
+    outcomes = enrich_pending(db, dry_run=args.dry_run, limit=args.limit)
 
     # Summary
     by_parser: Counter[str] = Counter()

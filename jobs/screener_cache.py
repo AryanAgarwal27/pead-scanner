@@ -64,6 +64,16 @@ def main() -> int:
         action="store_true",
         help="Skip the BSE↔NSE map refresh stage.",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help=(
+            "Process only the first N tickers (alphabetical). "
+            "Use for incremental backfill validation before a full run. "
+            "Does NOT affect the symbol-map refresh stage. Default: process all."
+        ),
+    )
     args = parser.parse_args()
 
     db = get_client()
@@ -76,7 +86,15 @@ def main() -> int:
     else:
         tickers = _select_tickers_from_filings(db)
 
-    log.info(f"screener-cache: {len(tickers)} tickers to consider")
+    total = len(tickers)
+    if args.limit is not None and args.limit < total:
+        tickers = tickers[: args.limit]
+        log.info(
+            f"screener-cache: {total} tickers selected; --limit={args.limit} -> "
+            f"processing first {len(tickers)}"
+        )
+    else:
+        log.info(f"screener-cache: {len(tickers)} tickers to consider")
 
     status: Counter[str] = Counter()
     for ticker in tickers:

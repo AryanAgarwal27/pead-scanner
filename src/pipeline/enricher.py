@@ -86,12 +86,17 @@ class EnrichOutcome:
     error: str | None = None
 
 
-def enrich_pending(db, *, dry_run: bool = False) -> list[EnrichOutcome]:
-    """Process all filings within the 14-day window that lack a metrics row.
+def enrich_pending(
+    db, *, dry_run: bool = False, limit: int | None = None
+) -> list[EnrichOutcome]:
+    """Process filings within the 14-day window that lack a metrics row.
 
     Args:
         db: supabase client (from `src.db.client.get_client()`).
         dry_run: if True, computes everything but writes nothing.
+        limit: if set, process only the first N pending filings (oldest-first
+            per filing_time). Aged-out warning logs are NOT subject to the
+            limit — operators always see the full list of stale filings.
 
     Returns one EnrichOutcome per filing processed. Also emits WARNING logs
     for filings older than ENRICH_WINDOW_DAYS that still lack metrics.
@@ -99,7 +104,17 @@ def enrich_pending(db, *, dry_run: bool = False) -> list[EnrichOutcome]:
     _log_aged_out(db)
 
     pending = _select_pending(db)
-    log.info(f"enricher: {len(pending)} filings pending (within {ENRICH_WINDOW_DAYS}-day window)")
+    total = len(pending)
+    if limit is not None and limit < total:
+        pending = pending[:limit]
+        log.info(
+            f"enricher: {total} filings pending; --limit={limit} -> "
+            f"processing first {len(pending)} (within {ENRICH_WINDOW_DAYS}-day window)"
+        )
+    else:
+        log.info(
+            f"enricher: {total} filings pending (within {ENRICH_WINDOW_DAYS}-day window)"
+        )
     outcomes: list[EnrichOutcome] = []
 
     for f in pending:
