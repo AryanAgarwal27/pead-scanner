@@ -12,21 +12,24 @@ See [BRD.md](BRD.md) for goals, architecture, data model, and phased delivery pl
 
 ## Current phase
 
-Phase 1 — BSE Day-0 alerts. Every 15 minutes during market hours (Mon–Fri, 03:00–11:59 UTC ≈ 08:30–17:29 IST) the [poll-filings workflow](.github/workflows/poll-filings.yml) hits the BSE result-category announcement API, derives the reporting quarter, upserts into Supabase, and sends a Telegram alert for each new filing (or a batched summary if >10 land in one poll).
+Phase 2 — multi-source resilience. The [poll-filings workflow](.github/workflows/poll-filings.yml) runs every 15 minutes during market hours (Mon–Fri, 03:00–14:59 UTC ≈ 08:30–20:30 IST) and now polls **NSE + BSE in parallel** (per BRD §3.1 FR-1.2, both are primary). If both primaries error in the same run, the [detector](src/pipeline/detector.py) falls back to [Trendlyne](src/sources/trendlyne.py). A daily [heartbeat workflow](.github/workflows/heartbeat.yml) sends a status snapshot at 09:00 IST. Source failures are alerted to Telegram with a 1-per-hour-per-source cooldown.
 
-NSE / Trendlyne failover, enrichment, scoring, and signal generation are deferred to later phases.
+Enrichment, scoring, and signal generation are deferred to Phase 3+.
 
 ### Manual run
 
 ```bash
-# Polls today (IST) by default:
+# Polls today (IST) by default — NSE + BSE primaries:
 python jobs/poll_filings.py
 
 # Replay a past trading day for testing:
 python jobs/poll_filings.py --date 2026-05-23
 
-# Dry-run (skip Supabase filings writes + Telegram sends; print summary):
+# Dry-run (skip filings writes + Telegram sends; print summary):
 python jobs/poll_filings.py --date 2026-05-14 --dry-run
+
+# Heartbeat: probe all sources, send status snapshot:
+python jobs/heartbeat.py
 ```
 
 ## How to run locally

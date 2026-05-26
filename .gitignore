@@ -56,3 +56,5 @@ coverage.xml
 *.swo
 .DS_Store
 Thumbs.db
+.claude
+.playwright-mcp/

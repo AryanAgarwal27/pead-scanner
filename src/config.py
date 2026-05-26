@@ -34,13 +34,21 @@ GEMINI_API_KEY: str | None = os.getenv("GEMINI_API_KEY")
 # ---------------------------------------------------------------------------
 # Source failover order (BRD §3.1, §5.1).
 # ---------------------------------------------------------------------------
-SOURCES_ORDER = ["NSE", "BSE", "TRENDLYNE"]  # TODO: phase 2 (Phase 1 hard-codes BSE only)
+SOURCES_ORDER = ["NSE", "BSE", "TRENDLYNE"]  # wired in src.pipeline.detector (Phase 2)
 
 
 # ---------------------------------------------------------------------------
 # Day-0 polling (Phase 1, BRD §3.2 FR-2.4).
 # ---------------------------------------------------------------------------
 POLL_BATCH_THRESHOLD = 10  # if >N new filings land in one poll, condense to a batched message
+
+
+# ---------------------------------------------------------------------------
+# Multi-source resilience (Phase 2, BRD §3.7).
+# ---------------------------------------------------------------------------
+SOURCE_FETCH_TIMEOUT_SECONDS = 30          # per-source HTTP budget (used by retry helper)
+HEARTBEAT_PROBE_TIMEOUT_SECONDS = 10       # tighter budget for daily heartbeat probes
+ERROR_ALERT_COOLDOWN_MINUTES = 60          # FR-7.2: at most one alert per source per hour
 
 
 # ---------------------------------------------------------------------------

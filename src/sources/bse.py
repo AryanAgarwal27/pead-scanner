@@ -41,12 +41,12 @@ Symbol field (per Phase 1 Q2 decision):
 """
 
 import re
-from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import requests
 
+from src.sources.base import Filing
 from src.utils import time_utils
 from src.utils.logging import get_logger
 from src.utils.retry import with_retries
@@ -81,16 +81,10 @@ def _is_financial_result(row: dict[str, Any]) -> bool:
     return bool(_FINANCIAL_RESULT_SUBCAT_RE.search(row.get("SUBCATNAME") or ""))
 
 
-@dataclass
-class BseFiling:
-    symbol: str
-    company_name: str
-    quarter: str
-    quarter_source: str
-    filing_time: datetime
-    filing_url: str | None
-    is_consolidated: bool | None
-    raw_payload: dict[str, Any]
+# Phase 2: source-agnostic dataclass lives in base.py. Re-export so existing
+# `from src.sources.bse import BseFiling` imports keep working through Phase 2
+# transition; new code should import Filing directly from base.
+BseFiling = Filing
 
 
 _PAGE_SIZE = 50      # BSE returns up to 50 rows per page
@@ -121,7 +115,7 @@ def _fetch_page(yyyymmdd: str, pageno: int) -> dict[str, Any]:
     return resp.json() or {}
 
 
-def fetch_today_results(target_date: date | None = None) -> list[BseFiling]:
+def fetch_today_results(target_date: date | None = None) -> list[Filing]:
     """Fetch result-category announcements for `target_date` (IST). Default: today.
 
     Paginates over BSE's 50-rows-per-page API until all ROWCNT rows are collected
@@ -151,7 +145,7 @@ def fetch_today_results(target_date: date | None = None) -> list[BseFiling]:
         f"(ROWCNT={total}, pages_fetched={pageno})"
     )
 
-    filings: list[BseFiling] = []
+    filings: list[Filing] = []
     dropped_subcat = 0
     for row in raw_rows:
         if not _is_financial_result(row):
@@ -180,7 +174,7 @@ def _row_subject(row: dict[str, Any]) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-def _normalize(row: dict[str, Any], subject: str) -> BseFiling:
+def _normalize(row: dict[str, Any], subject: str) -> Filing:
     scrip_code = str(row.get("SCRIP_CD") or "").strip()
     company_name = (row.get("SLONGNAME") or row.get("NEWSSUB") or "").strip()
 
@@ -206,7 +200,8 @@ def _normalize(row: dict[str, Any], subject: str) -> BseFiling:
     payload = dict(row)
     # Breadcrumb so post-hoc audits can tell whether the quarter came from regex or fallback.
     payload["_quarter_source"] = source
-    return BseFiling(
+    return Filing(
+        source="BSE",
         symbol=scrip_code,
         company_name=company_name,
         quarter=quarter,
@@ -239,3 +234,12 @@ def _detect_consolidated(headline: str) -> bool | None:
     if "standalone" in h:
         return False
     return None
+
+
+class BseSource:
+    """Phase 2 Protocol adapter — thin class wrapper around fetch_today_results."""
+
+    name = "BSE"
+
+    def fetch(self, target_date: date | None = None) -> list[Filing]:
+        return fetch_today_results(target_date)

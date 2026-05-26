@@ -7,13 +7,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from jobs import poll_filings
-from src.sources.bse import BseFiling
+from src.sources.base import Filing
 
 
-def _make_filing(symbol: str) -> BseFiling:
-    return BseFiling(
+def _make_filing(source: str, symbol: str) -> Filing:
+    return Filing(
+        source=source,
         symbol=symbol,
-        company_name=f"Co {symbol}",
+        company_name=f"{source}-{symbol}",
         quarter="Q1-FY27",
         quarter_source="headline",
         filing_time=datetime(2026, 5, 14, 10, tzinfo=UTC),
@@ -25,20 +26,31 @@ def _make_filing(symbol: str) -> BseFiling:
 
 @pytest.fixture
 def wired(monkeypatch):
-    """Wire mocks for DB client, BSE fetch, and TelegramNotifier."""
+    """Wire mocks for DB client, detector, and TelegramNotifier.
+
+    Phase 2 changed the orchestrator to call src.pipeline.detector.detect_filings
+    (which fans out to NSE + BSE + Trendlyne). We stub that out to return
+    controlled filings so the dry-run path is exercised without network.
+    """
     mock_db = MagicMock()
     # Dedup SELECT returns no pre-existing rows → every fetched filing would alert.
-    (
-        mock_db.table.return_value.select.return_value.in_.return_value.in_.return_value
-        .execute.return_value.data
-    ) = []
+    sel_chain = (
+        mock_db.table.return_value
+        .select.return_value
+        .in_.return_value
+        .in_.return_value
+    )
+    sel_chain.execute.return_value.data = []
     monkeypatch.setattr(poll_filings, "get_client", lambda: mock_db)
 
     mock_notifier_cls = MagicMock()
     monkeypatch.setattr(poll_filings, "TelegramNotifier", mock_notifier_cls)
 
-    fake_filings = [_make_filing("100"), _make_filing("200")]
-    monkeypatch.setattr(poll_filings, "fetch_today_results", lambda d: fake_filings)
+    fake_filings = [_make_filing("NSE", "FOO"), _make_filing("BSE", "100")]
+    # detect_filings signature: (db, notifier, target_date) -> list[Filing]
+    monkeypatch.setattr(
+        poll_filings, "detect_filings", lambda db, notifier, d: fake_filings
+    )
 
     return mock_db, mock_notifier_cls, fake_filings
 
@@ -58,19 +70,27 @@ class TestDryRun:
         mock_db.table.return_value.upsert.assert_not_called()
         mock_db.table.return_value.update.assert_not_called()
 
-        # source_health row IS written, with error_msg='dry_run' marker.
-        mock_db.table.return_value.insert.assert_called_once()
-        payload = mock_db.table.return_value.insert.call_args.args[0]
-        assert payload["error_msg"] == "dry_run"
+        # source_health row IS written by the orchestrator with error_msg='dry_run'
+        # marker. (Detector writes per-source rows separately; we stub that out.)
+        insert_calls = mock_db.table.return_value.insert.call_args_list
+        dry_run_inserts = [
+            c for c in insert_calls
+            if c.args and c.args[0].get("error_msg") == "dry_run"
+        ]
+        assert len(dry_run_inserts) == 1
+        payload = dry_run_inserts[0].args[0]
         assert payload["ok"] is True
         assert payload["records_found"] == 2
-        assert payload["source"] == "BSE"
+        # Phase 2: orchestrator row uses source="POLL" to distinguish from
+        # per-source rows that the detector writes.
+        assert payload["source"] == "POLL"
 
         # Structured summary printed.
         out = capsys.readouterr().out
         assert "DRY RUN SUMMARY" in out
         assert "Date: 2026-05-14" in out
-        assert "BSE filings (after SUBCATNAME filter): 2" in out
+        assert "Filings (all sources, post-detector): 2" in out
+        assert "NSE" in out and "BSE" in out
         assert "Would alert (after dedup): 2" in out
         assert "--- Message 1 ---" in out
 

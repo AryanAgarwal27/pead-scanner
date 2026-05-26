@@ -1,9 +1,14 @@
-"""Phase 1 orchestrator: poll BSE for today's quarterly result filings, upsert,
-alert via Telegram, log source health.
+"""Phase 2 orchestrator: poll NSE + BSE (and Trendlyne fallback) for today's
+quarterly result filings, upsert, alert via Telegram, log source health.
 
 Idempotent — re-runs do not duplicate alerts. A row whose insert succeeded but
 whose Telegram send failed on a previous run will be re-alerted on the next
 run, because the retry path keys off `alerted_at IS NULL`.
+
+Per-source source_health rows are written by the detector (`src.pipeline.detector`);
+this file writes one ORCHESTRATOR-level summary row tagged source="POLL" so
+poll-time aggregates (records_found = total post-detector) stay separable from
+per-source rows.
 
 Usage:
     python jobs/poll_filings.py
@@ -18,7 +23,8 @@ from src import config
 from src.db.client import get_client
 from src.notify.formatters import format_batched, format_single_filing
 from src.notify.telegram import TelegramNotifier
-from src.sources.bse import BseFiling, fetch_today_results
+from src.pipeline.detector import detect_filings
+from src.sources.base import Filing
 from src.utils.logging import get_logger
 from src.utils.time_utils import today_ist
 
@@ -47,14 +53,19 @@ def main() -> int:
     target_date = args.date or today_ist()
     dry_run = args.dry_run
     suffix = " [DRY RUN]" if dry_run else ""
-    log.info(f"Polling BSE for IST date={target_date.isoformat()}{suffix}")
+    log.info(f"Polling all sources for IST date={target_date.isoformat()}{suffix}")
 
     db = get_client()
+    # In dry-run, pass notifier=None so rate_limit logs but doesn't send.
+    notifier_for_detector = None if dry_run else TelegramNotifier()
     run_at = datetime.now(UTC)
     try:
-        filings = fetch_today_results(target_date)
+        # Detector polls NSE + BSE in parallel (both primary), falls back to
+        # Trendlyne if BOTH error. Per-source source_health rows are written
+        # by the detector itself.
+        filings = detect_filings(db, notifier_for_detector, target_date)
     except Exception as e:
-        log.exception("BSE fetch failed")
+        log.exception("Detector failed")
         _log_source_health(db, run_at, ok=False, error=str(e), records=0)
         raise
 
@@ -70,8 +81,8 @@ def main() -> int:
     if to_insert:
         _perform_upsert(db, to_insert)
     if to_alert:
-        notifier = TelegramNotifier()
-        _send_alerts(notifier, to_alert)
+        # Reuse the detector's notifier — already constructed above.
+        _send_alerts(notifier_for_detector, to_alert)
         _mark_alerted(db, to_alert)
 
     _log_source_health(db, run_at, ok=True, error=None, records=len(filings))
@@ -87,8 +98,8 @@ def _parse_iso_date(s: str) -> date:
 
 
 def _classify_filings(
-    db, filings: list[BseFiling]
-) -> tuple[list[BseFiling], list[BseFiling]]:
+    db, filings: list[Filing]
+) -> tuple[list[Filing], list[Filing]]:
     """Read-only classification of fetched filings against existing DB state.
 
     Returns (to_insert, to_alert). A filing needs alerting when either it's new
@@ -112,8 +123,8 @@ def _classify_filings(
         for r in (existing_resp.data or [])
     }
 
-    to_insert: list[BseFiling] = []
-    to_alert: list[BseFiling] = []
+    to_insert: list[Filing] = []
+    to_alert: list[Filing] = []
     for f in filings:
         key = (f.symbol, f.quarter)
         if key not in existing_alerted:
@@ -125,14 +136,14 @@ def _classify_filings(
     return to_insert, to_alert
 
 
-def _perform_upsert(db, to_insert: list[BseFiling]) -> None:
+def _perform_upsert(db, to_insert: list[Filing]) -> None:
     payload = [
         {
             "symbol": f.symbol,
             "company_name": f.company_name,
             "quarter": f.quarter,
             "filing_time": f.filing_time.isoformat(),
-            "source": "BSE",
+            "source": f.source,  # Phase 2: detector provides actual source per filing
             "filing_url": f.filing_url,
             "is_consolidated": f.is_consolidated,
             "raw_payload": f.raw_payload,
@@ -144,7 +155,7 @@ def _perform_upsert(db, to_insert: list[BseFiling]) -> None:
     db.table("filings").upsert(payload, on_conflict="symbol,quarter").execute()
 
 
-def _send_alerts(notifier: TelegramNotifier, to_alert: list[BseFiling]) -> None:
+def _send_alerts(notifier: TelegramNotifier, to_alert: list[Filing]) -> None:
     if len(to_alert) > config.POLL_BATCH_THRESHOLD:
         for body in format_batched(to_alert):
             notifier.send_markdown(body)
@@ -153,7 +164,7 @@ def _send_alerts(notifier: TelegramNotifier, to_alert: list[BseFiling]) -> None:
             notifier.send_markdown(format_single_filing(f))
 
 
-def _mark_alerted(db, to_alert: list[BseFiling]) -> None:
+def _mark_alerted(db, to_alert: list[Filing]) -> None:
     now = datetime.now(UTC).isoformat()
     for f in to_alert:
         db.table("filings").update({"alerted_at": now}).eq("symbol", f.symbol).eq(
@@ -164,11 +175,12 @@ def _mark_alerted(db, to_alert: list[BseFiling]) -> None:
 def _log_source_health(
     db, run_at: datetime, ok: bool, error: str | None, records: int
 ) -> None:
+    """Orchestrator-level summary row. Per-source rows are written by the detector."""
     try:
         db.table("source_health").insert(
             {
                 "run_at": run_at.isoformat(),
-                "source": "BSE",
+                "source": "POLL",
                 "ok": ok,
                 "error_msg": error,
                 "records_found": records,
@@ -179,12 +191,18 @@ def _log_source_health(
 
 
 def _print_dry_run_summary(
-    target_date: date, filings: list[BseFiling], to_alert: list[BseFiling]
+    target_date: date, filings: list[Filing], to_alert: list[Filing]
 ) -> None:
     print()
     print("DRY RUN SUMMARY")
     print(f"  Date: {target_date.isoformat()}")
-    print(f"  BSE filings (after SUBCATNAME filter): {len(filings)}")
+    # Phase 2: filings is the post-detector merged set across NSE+BSE (+Trendlyne if both errored).
+    print(f"  Filings (all sources, post-detector): {len(filings)}")
+    by_source: dict[str, int] = {}
+    for f in filings:
+        by_source[f.source] = by_source.get(f.source, 0) + 1
+    for src, cnt in sorted(by_source.items()):
+        print(f"    {src:<11} {cnt}")
     print(f"  Would alert (after dedup): {len(to_alert)}")
     if to_alert:
         n = min(3, len(to_alert))

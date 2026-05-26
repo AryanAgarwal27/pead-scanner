@@ -20,6 +20,7 @@ def _make_filing(
     is_consolidated=False,
 ) -> BseFiling:
     return BseFiling(
+        source="BSE",
         symbol=symbol,
         company_name=company,
         quarter=quarter,
