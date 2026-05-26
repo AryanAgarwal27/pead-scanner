@@ -37,10 +37,12 @@ def format_ist(dt: datetime) -> str:
 def parse_bse_timestamp(s: str) -> datetime:
     """Parse a BSE-style timestamp string (IST, no tz info) to a tz-aware UTC datetime."""
     s = (s or "").strip()
+    # ISO with T-separator covers News_submission_dt and DT_TM (with or without millis).
     for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
         "%d-%b-%Y %H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
     ):
