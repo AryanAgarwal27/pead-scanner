@@ -9,6 +9,14 @@ dependencies = [
     "requests>=2.31",
     "python-dotenv>=1.0",
     "supabase>=2.5",
+    # Phase 3 — enrichment layer
+    "google-genai>=1.0",      # Gemini PDF parser (new SDK; `google.genai`, not legacy `google.generativeai`)
+    "pydantic>=2.0",          # response schema enforcement on LLM output
+    "yfinance>=0.2.40",       # OHLCV pulls for Vol_Spike, EAR
+    "pandas>=2.0",            # yfinance returns DataFrames; metric vectorization
+    "beautifulsoup4>=4.12",   # Screener.in HTML parsing
+    "lxml>=5.0",              # bs4 parser backend
+    "pypdf>=4.0",             # regex-fallback PDF text extraction
 ]
 
 [project.optional-dependencies]

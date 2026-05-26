@@ -1,0 +1,47 @@
+name: screener-cache
+
+on:
+  schedule:
+    # BRD §5.2: 23:30 IST (= 18:00 UTC) daily — after enrich-eod finishes.
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: screener-cache
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25      # ~200 tickers × 1s sleep + ~1s fetch each ≈ 7min; plus headroom
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Refresh
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python jobs/screener_cache.py
+
+      - name: Commit refreshed BSE↔NSE map
+        if: github.ref == 'refs/heads/main'
+        run: |
+          if [[ -n "$(git status --porcelain src/data/bse_to_nse.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add src/data/bse_to_nse.json
+            git commit -m "chore(screener-cache): refresh BSE↔NSE map"
+            git push
+          else
+            echo "bse_to_nse.json unchanged — skipping commit"
+          fi

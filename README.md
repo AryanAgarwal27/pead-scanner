@@ -12,9 +12,20 @@ See [BRD.md](BRD.md) for goals, architecture, data model, and phased delivery pl
 
 ## Current phase
 
-Phase 2 — multi-source resilience. The [poll-filings workflow](.github/workflows/poll-filings.yml) runs every 15 minutes during market hours (Mon–Fri, 03:00–14:59 UTC ≈ 08:30–20:30 IST) and now polls **NSE + BSE in parallel** (per BRD §3.1 FR-1.2, both are primary). If both primaries error in the same run, the [detector](src/pipeline/detector.py) falls back to [Trendlyne](src/sources/trendlyne.py). A daily [heartbeat workflow](.github/workflows/heartbeat.yml) sends a status snapshot at 09:00 IST. Source failures are alerted to Telegram with a 1-per-hour-per-source cooldown.
+Phase 3 — enrichment layer. On top of the Phase 2 detector, the system now parses
+filing PDFs via Gemini (with a regex fallback), pulls historical fundamentals from
+Screener.in nightly, fetches OHLCV from yfinance, and computes the 5 PEAD component
+metrics (SUE, Rev Growth YoY, Vol Spike, EAR, Margin Delta) into the [metrics](src/db/schema.sql)
+table. Scoring, filtering, and signal generation are deferred to Phase 4+.
 
-Enrichment, scoring, and signal generation are deferred to Phase 3+.
+### Jobs
+
+| Job | Workflow | Schedule | Purpose |
+|---|---|---|---|
+| poll-filings | [.github/workflows/poll-filings.yml](.github/workflows/poll-filings.yml) | every 15 min, 08:30–20:30 IST, Mon–Fri | NSE + BSE primaries, Trendlyne fallback, Day-0 Telegram alerts |
+| heartbeat | [.github/workflows/heartbeat.yml](.github/workflows/heartbeat.yml) | 09:00 IST, Mon–Fri | Daily source-health snapshot |
+| enrich-eod | [.github/workflows/enrich-eod.yml](.github/workflows/enrich-eod.yml) | 20:30 IST, Mon–Fri | Gemini PDF parse + 5 PEAD metric computation |
+| screener-cache | [.github/workflows/screener-cache.yml](.github/workflows/screener-cache.yml) | 23:30 IST, daily | Refresh Screener.in fundamentals + BSE↔NSE symbol map |
 
 ### Manual run
 
@@ -30,7 +41,27 @@ python jobs/poll_filings.py --date 2026-05-14 --dry-run
 
 # Heartbeat: probe all sources, send status snapshot:
 python jobs/heartbeat.py
+
+# Enrichment: parse PDFs + compute metrics for filings in the last 14 days:
+python jobs/enrich_eod.py
+python jobs/enrich_eod.py --dry-run
+
+# Nightly Screener cache + BSE↔NSE symbol map refresh:
+python jobs/screener_cache.py
+python jobs/screener_cache.py --symbols HDFCBANK,RELIANCE   # ad hoc subset
+
+# One-shot BSE↔NSE symbol map refresh (also called by screener_cache):
+python -m src.sources.symbol_map refresh
 ```
+
+### First-time Phase 3 setup
+
+Before the first `enrich_eod` run, ensure:
+
+1. Apply [migrations/phase3_alter.sql](migrations/phase3_alter.sql) in Supabase SQL Editor.
+2. (Optional but recommended) Bootstrap the BSE↔NSE symbol map so BSE filings can join
+   Screener fundamentals: `python -m src.sources.symbol_map refresh`. The
+   `screener-cache` job will refresh this weekly thereafter.
 
 ## How to run locally
 

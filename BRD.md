@@ -1,13 +1,14 @@
 # Business Requirements Document
 ## PEAD Scanner — Indian Stock Market Earnings Signal System
 
-**Version:** 1.3
+**Version:** 1.4
 **Owner:** Aryan Agarwal
 **Repository:** https://github.com/AryanAgarwal27/pead-scanner
-**Status:** Phase 1 complete; Phase 2 pending
+**Status:** Phase 2 complete; Phase 3 in progress
 **Target Stack:** Python 3.11+, GitHub Actions, Supabase (Postgres), Telegram Bot API, Gemini API (free tier)
 
 **Changelog:**
+- v1.4 — Added §6.6 `fundamentals` table for Phase 3 enrichment layer (nightly Screener.in cache, NSE-ticker-only per Option A); added `revenue_yoy_pct` / `pat_yoy_pct` columns to §6.1 filings table
 - v1.3 — Corrected job schedule: poll-filings extended to 20:30 IST (Indian results are filed mostly post-close, not during market hours); enrich/signal jobs shifted to 8:30/8:45 PM IST after result-filing window closes
 - v1.2 — Added repository URL, Phase 0 bootstrap, explicit first-prompt instructions for Claude Code
 - v1.1 — Added LLM-based filing parser (Gemini), signal tiering with confirmation checklist, position sizing tiers
@@ -375,6 +376,48 @@ CREATE TABLE source_health (
     records_found   INT
 );
 ```
+
+### 6.6 `fundamentals` table  *(added in Phase 3)*
+
+Nightly cache of Screener.in fundamental data. Feeds the enricher (BRD §3.3
+FR-3.1) with 8 quarters of historical PAT/Revenue/OPM, used to compute SUE
+and Margin_Delta.
+
+```sql
+CREATE TABLE fundamentals (
+    symbol           TEXT PRIMARY KEY,         -- NSE ticker, e.g. 'HDFCBANK'
+    company_name     TEXT,
+    market_cap_cr    NUMERIC,
+    sector           TEXT,
+    quarterly_pat    JSONB,                    -- [{"quarter":"Q3-FY26","value":123.4}, ...] newest first, up to 8 items
+    quarterly_rev    JSONB,
+    quarterly_opm    JSONB,
+    on_screener      BOOLEAN NOT NULL,
+    last_404_at      TIMESTAMPTZ,
+    fetched_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+**Design rationale — Option A (NSE-ticker-only PK):**
+
+The `symbol` column is *always* an NSE ticker. BSE-only stocks (no NSE
+listing) are NOT stored in this table — the enricher resolves
+`filings.symbol → NSE ticker` via the symbol map; a resolution miss puts the
+stock on the `on_screener=false` code path, where `sue_proxy` and
+`margin_delta` are set to NULL while price-derived metrics (`vol_spike`,
+`ear`) are still computed from yfinance's `.BO` feed.
+
+This keeps symbol semantics globally consistent across `fundamentals`,
+`symbol_map`, and `yfinance_adapter` (all canonicalize on NSE tickers),
+avoids a composite PK or `primary_exchange` disambiguator, and accepts a
+small, quantifiable loss: SUE/Margin_Delta unavailable for the ~2% of daily
+filings from BSE-only stocks — which are largely excluded anyway by
+Phase 4's hard filters (market cap ≥ ₹500 Cr, ≥ 2 years listed).
+
+**Negative-cache TTL:** `on_screener=false` rows are kept (so we don't
+re-hit Screener every night for a ticker it doesn't index), but
+`last_404_at` gives them a 30-day TTL — Screener occasionally adds coverage
+for newly liquid stocks, so we re-check periodically.
 
 ---
 
