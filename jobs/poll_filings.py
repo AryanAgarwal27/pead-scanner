@@ -8,6 +8,7 @@ run, because the retry path keys off `alerted_at IS NULL`.
 Usage:
     python jobs/poll_filings.py
     python jobs/poll_filings.py --date 2026-05-23
+    python jobs/poll_filings.py --date 2026-05-14 --dry-run
 """
 
 import argparse
@@ -32,13 +33,23 @@ def main() -> int:
         default=None,
         help="IST date (YYYY-MM-DD) to poll. Default: today (IST).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the full pipeline (fetch, dedup, format) WITHOUT writing to the "
+            "filings table or sending Telegram messages. A source_health row is "
+            "still written with error_msg='dry_run' so the run is identifiable. "
+            "Prints a structured summary on stdout."
+        ),
+    )
     args = parser.parse_args()
     target_date = args.date or today_ist()
-    log.info(f"Polling BSE for IST date={target_date.isoformat()}")
+    dry_run = args.dry_run
+    suffix = " [DRY RUN]" if dry_run else ""
+    log.info(f"Polling BSE for IST date={target_date.isoformat()}{suffix}")
 
     db = get_client()
-    notifier = TelegramNotifier()
-
     run_at = datetime.now(UTC)
     try:
         filings = fetch_today_results(target_date)
@@ -47,10 +58,19 @@ def main() -> int:
         _log_source_health(db, run_at, ok=False, error=str(e), records=0)
         raise
 
-    to_alert = _upsert_and_select_alertable(db, filings)
+    to_insert, to_alert = _classify_filings(db, filings)
     log.info(f"{len(to_alert)} filings need alerts (out of {len(filings)} fetched)")
 
+    if dry_run:
+        _print_dry_run_summary(target_date, filings, to_alert)
+        _log_source_health(db, run_at, ok=True, error="dry_run", records=len(filings))
+        log.info("done [DRY RUN]")
+        return 0
+
+    if to_insert:
+        _perform_upsert(db, to_insert)
     if to_alert:
+        notifier = TelegramNotifier()
         _send_alerts(notifier, to_alert)
         _mark_alerted(db, to_alert)
 
@@ -66,10 +86,17 @@ def _parse_iso_date(s: str) -> date:
         raise argparse.ArgumentTypeError(f"invalid date {s!r}, expected YYYY-MM-DD") from e
 
 
-def _upsert_and_select_alertable(db, filings: list[BseFiling]) -> list[BseFiling]:
-    """Insert new rows; return rows that still need an alert (new OR alerted_at IS NULL)."""
+def _classify_filings(
+    db, filings: list[BseFiling]
+) -> tuple[list[BseFiling], list[BseFiling]]:
+    """Read-only classification of fetched filings against existing DB state.
+
+    Returns (to_insert, to_alert). A filing needs alerting when either it's new
+    (to_insert) OR it was previously inserted but alerted_at IS NULL (retry path
+    after a failed send).
+    """
     if not filings:
-        return []
+        return [], []
 
     symbols = list({f.symbol for f in filings})
     quarters = list({f.quarter for f in filings})
@@ -95,25 +122,26 @@ def _upsert_and_select_alertable(db, filings: list[BseFiling]) -> list[BseFiling
         elif not existing_alerted[key]:
             # Previously inserted but alert never went out — retry just the alert.
             to_alert.append(f)
+    return to_insert, to_alert
 
-    if to_insert:
-        payload = [
-            {
-                "symbol": f.symbol,
-                "company_name": f.company_name,
-                "quarter": f.quarter,
-                "filing_time": f.filing_time.isoformat(),
-                "source": "BSE",
-                "filing_url": f.filing_url,
-                "is_consolidated": f.is_consolidated,
-                "raw_payload": f.raw_payload,
-            }
-            for f in to_insert
-        ]
-        # upsert (not insert) protects against a concurrent run inserting the
-        # same key between our SELECT and INSERT.
-        db.table("filings").upsert(payload, on_conflict="symbol,quarter").execute()
-    return to_alert
+
+def _perform_upsert(db, to_insert: list[BseFiling]) -> None:
+    payload = [
+        {
+            "symbol": f.symbol,
+            "company_name": f.company_name,
+            "quarter": f.quarter,
+            "filing_time": f.filing_time.isoformat(),
+            "source": "BSE",
+            "filing_url": f.filing_url,
+            "is_consolidated": f.is_consolidated,
+            "raw_payload": f.raw_payload,
+        }
+        for f in to_insert
+    ]
+    # upsert (not insert) protects against a concurrent run inserting the
+    # same key between our SELECT and INSERT.
+    db.table("filings").upsert(payload, on_conflict="symbol,quarter").execute()
 
 
 def _send_alerts(notifier: TelegramNotifier, to_alert: list[BseFiling]) -> None:
@@ -148,6 +176,26 @@ def _log_source_health(
         ).execute()
     except Exception as e:
         log.warning(f"source_health write failed: {e}")
+
+
+def _print_dry_run_summary(
+    target_date: date, filings: list[BseFiling], to_alert: list[BseFiling]
+) -> None:
+    print()
+    print("DRY RUN SUMMARY")
+    print(f"  Date: {target_date.isoformat()}")
+    print(f"  BSE filings (after SUBCATNAME filter): {len(filings)}")
+    print(f"  Would alert (after dedup): {len(to_alert)}")
+    if to_alert:
+        n = min(3, len(to_alert))
+        print(f"  Sample messages (first {n}):")
+        for i, f in enumerate(to_alert[:n], 1):
+            print(f"    --- Message {i} ---")
+            for line in format_single_filing(f).splitlines():
+                print(f"    {line}")
+    else:
+        print("  Sample messages: (none — nothing would be alerted)")
+    print()
 
 
 if __name__ == "__main__":

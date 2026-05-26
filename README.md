@@ -24,6 +24,9 @@ python jobs/poll_filings.py
 
 # Replay a past trading day for testing:
 python jobs/poll_filings.py --date 2026-05-23
+
+# Dry-run (skip Supabase filings writes + Telegram sends; print summary):
+python jobs/poll_filings.py --date 2026-05-14 --dry-run
 ```
 
 ## How to run locally
