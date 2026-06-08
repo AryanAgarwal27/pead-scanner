@@ -47,9 +47,25 @@ source of truth.
 
 ## 2. Current state
 
-**Last completed:** Phase 4 — Scoring & Filtering (locally committed; see
-`git log`). Top-25 daily ranking is implemented; `migrations/phase4_alter.sql`
-must be applied to Supabase before the next `enrich-eod` workflow run.
+**Last completed:** Phase 5 — Signal Generation with tiering (committed and
+pushed to origin/main). Validated end-to-end on real data (`--as-of
+2026-05-29`): ranker → tiering → confirmations → levels → formatter → run
+summary all execute without error. IMPORTANT: emits 0 signals on the current
+backfill because ~94% of filings are dropped at Phase 3 `parser_confidence`
+(low/failed), leaving a 4-row cohort with compressed z-scores (top 0.62σ, all
+below the 2.0σ SKIP floor). The send/persist and per-signal-format path is
+therefore NOT yet exercised against a real fired signal. Also note:
+`PORTFOLIO_VALUE_INR` in `config.py` may still be the placeholder — set to the
+real figure before any live run, as it drives position sizing, C4 liquidity,
+and allocation math.
+
+**Migrations:** both `migrations/phase4_alter.sql` AND
+`migrations/phase5_alter.sql` are applied to Supabase (phase5 adds the
+`signals` table). **Phase 4 ranker bugfix (commit `fa0f118`):**
+`_select_cohort` previously anchored its 7-day window to `datetime.now()`
+instead of `run_date`, so `--as-of` replays silently queried "now"; fixed
+with a `run_date`-anchored window (IST day bounds, both lower+upper) plus a
+regression test.
 
 **Phases complete (verify by reading code, not just trusting this file):**
 
@@ -60,13 +76,16 @@ must be applied to Supabase before the next `enrich-eod` workflow run.
 | 2 | Multi-source resilience (NSE+BSE+Trendlyne failover), heartbeat | BRD §8 Phase 2 |
 | 3 | Enrichment — Gemini parser, Screener cache, yfinance, 5 PEAD metrics | BRD §8 Phase 3 |
 | 4 | Scoring, hard filters, cross-source dedup, top-25 ranking | BRD §8 Phase 4 |
+| 5 | Signal generation with tiering, confirmations, position sizing | BRD §8 Phase 5 |
 
 **Phase 3 historical backfill** (215 filings) was run in a separate terminal
 during the Phase 4 build. Status: check `metrics` table row count vs. `filings`
 in the 14-day window.
 
-**Next:** Phase 5 — Signal Generation with tiering. See BRD §3.5 (FR-5.1
-through FR-5.7) and BRD §8 Phase 5. Do NOT start until the user explicitly
+**Next:** Investigate the Phase 3 parser-confidence rejection rate (~94% of
+filings dropped at low/failed). This blocks the system from producing signals
+and must be resolved BEFORE Phase 6 — there is no value in a position tracker
+when nothing generates signals. Do NOT start Phase 6 until the user explicitly
 requests it.
 
 ---
