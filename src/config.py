@@ -14,6 +14,7 @@ current phase — useful for grepping "what is wired up vs. deferred."
 """
 
 import os
+from pathlib import Path as _Path
 
 from dotenv import load_dotenv
 
@@ -52,17 +53,35 @@ ERROR_ALERT_COOLDOWN_MINUTES = 60          # FR-7.2: at most one alert per sourc
 
 
 # ---------------------------------------------------------------------------
-# Hard filters (BRD §3.4 FR-4.3).
+# Hard filters (BRD §3.4 FR-4.3) — wired in src.pipeline.filterer (Phase 4).
 # ---------------------------------------------------------------------------
-MIN_MARKET_CAP_CR = 500          # TODO: phase 4
-MIN_DAILY_TURNOVER_CR = 5        # TODO: phase 4
-MIN_LISTING_YEARS = 2            # TODO: phase 4
+MIN_MARKET_CAP_CR = 500
+MIN_DAILY_TURNOVER_CR = 5
+MIN_LISTING_YEARS = 2
+
+# Parser-confidence floor: only filings parsed at these confidence levels are
+# admitted to the ranking cohort. 'low' and 'failed' are excluded. NULL
+# (Phase 2 filings predating LLM parsing) is also excluded — those should be
+# re-enriched, not ranked.
+PARSER_CONFIDENCE_FLOOR: frozenset[str] = frozenset({"high", "medium"})
+
+# Paths to the manually-maintained ban / surveillance lists (BRD §3.4 FR-4.3).
+# Both files ship as empty header-only templates; the operator appends rows
+# per the maintenance instructions in README. Format documented in
+# src/pipeline/banlists.py.
+_DATA_DIR = _Path(__file__).resolve().parent / "data"
+FNO_BAN_CSV = _DATA_DIR / "fno_ban.csv"
+ASM_GSM_CSV = _DATA_DIR / "asm_gsm.csv"
 
 
 # ---------------------------------------------------------------------------
 # Composite PEAD scoring weights (BRD §3.4 FR-4.1).
+# Wired in src.pipeline.scorer (Phase 4). Weights are renormalized on the
+# fly across whichever components are non-NULL for a given row, so a stock
+# with missing SUE/Margin (typical for BSE-only) is still scored on the
+# 3 price-derived components.
 # ---------------------------------------------------------------------------
-WEIGHTS = {                      # TODO: phase 4
+WEIGHTS = {
     "sue":    0.35,
     "rev":    0.20,
     "ear":    0.25,
@@ -70,11 +89,21 @@ WEIGHTS = {                      # TODO: phase 4
     "margin": 0.05,
 }
 
+# A row must have at least this many non-NULL z components to be ranked.
+# Score on 2 components is too noisy. The 3-component floor matches the
+# minimum coverage (EAR + Vol_Spike + Rev_Growth_YoY) we get from yfinance
+# + parser even when Screener fundamentals are missing.
+RANK_MIN_COMPONENTS = 3
+
+# A cohort with fewer than this many filings does not produce a ranking
+# (z-score noise dominates signal at very small N). Job logs and exits 0.
+RANK_MIN_COHORT_SIZE = 2
+
 
 # ---------------------------------------------------------------------------
 # Signal generation parameters (BRD §3.5).
 # ---------------------------------------------------------------------------
-TOP_N = 25                       # TODO: phase 4/5
+TOP_N = 25                       # ranking cap — Phase 4 (rank_eod); signal gen — Phase 5
 STOP_PCT_CAP = 0.05              # TODO: phase 5
 TARGET_R_MULTIPLE = 1.5          # TODO: phase 5
 ENTRY_WINDOW_DAYS = 5            # TODO: phase 5/6
@@ -85,7 +114,7 @@ TRAILING_EMA = 20                # TODO: phase 6
 # ---------------------------------------------------------------------------
 # Z-score cohort window (BRD §3.4 FR-4.2).
 # ---------------------------------------------------------------------------
-COHORT_WINDOW_DAYS = 7           # TODO: phase 4
+COHORT_WINDOW_DAYS = 7
 
 
 # ---------------------------------------------------------------------------

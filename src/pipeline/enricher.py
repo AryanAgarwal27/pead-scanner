@@ -67,6 +67,12 @@ Z_CHECK_LOWER = 0.2
 # yfinance window — 30 trading-day average covers ~45 calendar days.
 VOL_AVG_WINDOW_DAYS = 30
 
+# TODO: phase 4 follow-up. The Phase 4 filterer (src.pipeline.filterer) lazily
+# computes avg_30d_turnover_cr at ranking time using a second yfinance fetch
+# per filing. Post-Phase 6, fold that calculation into this enricher's
+# existing T-45..T+14 fetch so the filterer can read it straight from the
+# metrics row without re-pulling OHLCV.
+
 
 # ---------------------------------------------------------------------------
 # Public entry point — used by jobs/enrich_eod.py

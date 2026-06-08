@@ -33,3 +33,13 @@ jobs:
           SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python jobs/enrich_eod.py
+
+      # Phase 4: ranking runs inline after enrichment. Failure here fails the
+      # whole job — Phase 5's signal generator depends on the rankings table
+      # being populated for run_date=today, so a silent failure is worse than
+      # a loud one.
+      - name: Rank
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python jobs/rank_eod.py
