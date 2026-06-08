@@ -217,3 +217,209 @@ def _download(symbol: str, filing_date: date) -> pd.DataFrame | None:
         return None
     df = df[keep].dropna(how="all")
     return df
+
+
+# ===========================================================================
+# Phase 5 — signal-generation price helpers.
+#
+# These are ADDITIVE. They do not touch _download / fetch_ohlcv / fetch_nifty
+# (Phase 3's tested path keeps its exact signature + Close/Volume-only shape).
+# Phase 5 needs strictly more than Phase 3:
+#   * High/Low of the T+1 candle for entry/stop levels (FR-5.1)
+#   * corporate-action ex-dates around T+1 for confirmation C5 (FR-5.5)
+#   * Nifty 50 vs its 50-DMA for the market-regime confirmation C2 (FR-5.5)
+# so they ride on a separate, OHLC+actions download (`_download_full`).
+# ===========================================================================
+
+# 50-DMA needs ~50 trading days ≈ ~75 calendar days; pad generously.
+_REGIME_LOOKBACK_DAYS = 110
+_NIFTY_DMA_WINDOW = 50
+
+
+@dataclass
+class SignalWindow:
+    """OHLC + corporate-actions slice around a filing's filing_date.
+
+    Like PriceWindow but carries the full OHLC (entry = T+1 high, stop = T+1
+    low) plus Dividends / Stock Splits columns (confirmation C5). Indexed by
+    the NSE trading calendar — non-trading days are absent from df.index.
+    """
+
+    symbol_used: str
+    df: pd.DataFrame           # Open, High, Low, Close, Volume [, Dividends, Stock Splits]
+
+    @property
+    def empty(self) -> bool:
+        return self.df.empty
+
+
+def fetch_signal_window(
+    filing_symbol: str, source: str, filing_date: date
+) -> SignalWindow | None:
+    """Fetch OHLC + corporate actions around filing_date for one stock.
+
+    Symbol resolution and the .NS↔.BO fallback exactly mirror fetch_ohlcv —
+    we reuse resolve_yf_symbol so Phase 5 stays consistent with Phase 3's
+    canonicalization. Returns None if no symbol resolves or both candidates
+    return empty data.
+    """
+    preferred, fallback = resolve_yf_symbol(filing_symbol, source)
+    if preferred is None:
+        log.warning(
+            f"yfinance(signal): no symbol for filing_symbol={filing_symbol!r} source={source}"
+        )
+        return None
+
+    for candidate in (preferred, fallback):
+        if candidate is None:
+            continue
+        df = _download_full(candidate, filing_date)
+        if df is None or df.empty:
+            log.info(f"yfinance(signal): {candidate} returned empty for {filing_date}")
+            continue
+        return SignalWindow(symbol_used=candidate, df=df)
+
+    log.warning(
+        f"yfinance(signal): no OHLC for filing_symbol={filing_symbol!r} source={source} "
+        f"(tried {preferred}, {fallback})"
+    )
+    return None
+
+
+def candle_on_or_after(df: pd.DataFrame, target: date) -> dict[str, float] | None:
+    """OHLC of the first trading day on or after `target` (the T+1 candle).
+
+    Returns {'open','high','low','close'} or None if there's no trading day in
+    the window or High/Low are missing.
+    """
+    if df.empty:
+        return None
+    target_ts = pd.Timestamp(target)
+    after = df[df.index >= target_ts]
+    if after.empty:
+        return None
+    row = after.iloc[0]
+    try:
+        high = float(row["High"])
+        low = float(row["Low"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if pd.isna(high) or pd.isna(low):
+        return None
+    out = {"high": high, "low": low}
+    for col in ("Open", "Close"):
+        if col in after.columns:
+            v = row[col]
+            out[col.lower()] = float(v) if not pd.isna(v) else None
+    return out
+
+
+def corporate_action_within(
+    df: pd.DataFrame, center: date, window_trading_days: int
+) -> bool:
+    """True if a dividend / split ex-date falls within ±window_trading_days of
+    the first trading day on or after `center` (confirmation C5, FR-5.5).
+
+    Conservative on missing data: if the actions columns are absent (some
+    yfinance responses omit them when there were none), returns False — i.e.
+    "no corporate action seen", which lets C5 PASS. The signaler treats an
+    inconclusive C5 as a soft pass, never a hard skip (only C2/C4 are hard).
+    """
+    if df.empty:
+        return False
+    action_cols = [c for c in ("Dividends", "Stock Splits") if c in df.columns]
+    if not action_cols:
+        return False
+
+    target_ts = pd.Timestamp(center)
+    on_or_after = df[df.index >= target_ts]
+    if on_or_after.empty:
+        return False
+    center_pos = df.index.get_loc(on_or_after.index[0])
+    lo = max(0, center_pos - window_trading_days)
+    hi = min(len(df), center_pos + window_trading_days + 1)
+    window = df.iloc[lo:hi]
+    for col in action_cols:
+        series = window[col].fillna(0.0)
+        if (series != 0).any():
+            return True
+    return False
+
+
+def fetch_nifty_regime(as_of: date) -> tuple[float, float, bool] | None:
+    """Nifty 50 close vs its 50-DMA as of `as_of` (confirmation C2, FR-5.5).
+
+    Returns (close, dma50, is_above) where is_above = close > dma50, or None
+    if the fetch fails or there aren't 50 trading days of history. Computed
+    ONCE per signal run and applied to every signal — the market regime is a
+    single property of the run date. (For an --as-of replay over a multi-date
+    cohort this is approximate: it uses the as-of date's regime for all rows
+    rather than each filing's own T+1 regime. Acceptable for replays.)
+    """
+    start = as_of - timedelta(days=_REGIME_LOOKBACK_DAYS)
+    end = as_of + timedelta(days=3)
+    try:
+        df = yf.download(
+            NIFTY_SYMBOL,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            progress=False,
+            auto_adjust=True,
+            actions=False,
+            threads=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"yfinance: Nifty regime download exception: {e}")
+        return None
+    if df is None or df.empty:
+        log.warning(f"yfinance: Nifty regime returned empty for as_of={as_of}")
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if "Close" not in df.columns:
+        return None
+    closes = df["Close"].dropna()
+    # Only consider trading days up to as_of (don't peek past the run date).
+    closes = closes[closes.index <= pd.Timestamp(as_of)]
+    if len(closes) < _NIFTY_DMA_WINDOW:
+        log.warning(
+            f"yfinance: Nifty regime has {len(closes)} closes < {_NIFTY_DMA_WINDOW} "
+            f"needed for the 50-DMA (as_of={as_of})"
+        )
+        return None
+    dma50 = float(closes.tail(_NIFTY_DMA_WINDOW).mean())
+    close = float(closes.iloc[-1])
+    return close, dma50, close > dma50
+
+
+def _download_full(symbol: str, filing_date: date) -> pd.DataFrame | None:
+    """OHLC + actions download for the signal window. Separate from _download
+    so Phase 3's Close/Volume-only behavior is never perturbed."""
+    start = filing_date - timedelta(days=_PRE_BUFFER_DAYS)
+    end = filing_date + timedelta(days=_POST_BUFFER_DAYS)
+    try:
+        df = yf.download(
+            symbol,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            progress=False,
+            auto_adjust=False,   # raw OHLC — entry/stop are actual candle levels
+            actions=True,        # Dividends + Stock Splits columns for C5
+            threads=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"yfinance(signal): {symbol} download exception: {e}")
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    keep = [
+        c
+        for c in ("Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits")
+        if c in df.columns
+    ]
+    if "High" not in keep or "Low" not in keep:
+        return None
+    df = df[keep].dropna(subset=["High", "Low"])
+    return df

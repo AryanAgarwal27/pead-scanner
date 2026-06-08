@@ -1,11 +1,11 @@
--- Canonical Supabase schema for pead-scanner (Phases 0–4).
+-- Canonical Supabase schema for pead-scanner (Phases 0–5).
 -- Idempotent — safe to apply to an existing database.
 -- This file mirrors BRD §6 and is the single source of truth in code.
 --
 -- For applying phase deltas to a DB that already has the prior-phase tables,
 -- use migrations/phaseN_alter.sql — those files contain ONLY the deltas.
 --
--- Future phases (5+) will add: signals (§6.3), positions (§6.4).
+-- Future phases (6) will add: positions (§6.4).
 
 ------------------------------------------------------------------------------
 -- §6.1 filings — one row per quarterly result filing (deduped by symbol+quarter)
@@ -121,3 +121,36 @@ CREATE INDEX IF NOT EXISTS rankings_run_date_rank_idx
     ON rankings (run_date, rank);
 CREATE INDEX IF NOT EXISTS rankings_filing_id_idx
     ON rankings (filing_id);
+
+------------------------------------------------------------------------------
+-- §6.3 signals — Phase 5 tiered trade signals (one per filing, BRD §3.5).
+--   See migrations/phase5_alter.sql for the full design rationale.
+--   UNIQUE(filing_id) — a filing is signalled at most once, ever. Re-runs of
+--   generate-signals on the same/later day skip filings that already have a
+--   signal row (idempotent send). SKIP-tier and sizing-skipped candidates are
+--   never written — only actually-sent signals land here.
+------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS signals (
+    id                   BIGSERIAL PRIMARY KEY,
+    filing_id            BIGINT REFERENCES filings(id) ON DELETE CASCADE,
+    symbol               TEXT NOT NULL,                 -- canonical NSE ticker
+    rank                 INT NOT NULL,                  -- rank within the run's top-N
+    pead_score           NUMERIC NOT NULL,              -- composite z-score (σ), from rankings
+    tier                 TEXT NOT NULL,                 -- 'WATCH' | 'TAKE' | 'STRONG'
+    confirmations        JSONB NOT NULL,                -- {"C1": true, "C2": true, ...}
+    confirmations_passed INT NOT NULL,
+    suggested_size_r     NUMERIC NOT NULL,              -- 0.5 or 1.0 (R = risk per trade)
+    entry_price          NUMERIC NOT NULL,              -- high of T+1 candle
+    stop_price           NUMERIC NOT NULL,              -- tighter of (T+1 low, -5% from entry)
+    target1_price        NUMERIC NOT NULL,              -- entry + 1.5 × (entry - stop)
+    risk_reward          NUMERIC NOT NULL,              -- (target1 - entry) / (entry - stop)
+    signal_sent_at       TIMESTAMPTZ NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'PENDING_ENTRY',
+                         -- PENDING_ENTRY | ACTIVE | CLOSED_T1 | CLOSED_STOP | EXPIRED
+    UNIQUE (filing_id)
+);
+
+CREATE INDEX IF NOT EXISTS signals_status_idx
+    ON signals (status);
+CREATE INDEX IF NOT EXISTS signals_sent_at_idx
+    ON signals (signal_sent_at DESC);

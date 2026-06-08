@@ -104,11 +104,11 @@ RANK_MIN_COHORT_SIZE = 2
 # Signal generation parameters (BRD §3.5).
 # ---------------------------------------------------------------------------
 TOP_N = 25                       # ranking cap — Phase 4 (rank_eod); signal gen — Phase 5
-STOP_PCT_CAP = 0.05              # TODO: phase 5
-TARGET_R_MULTIPLE = 1.5          # TODO: phase 5
-ENTRY_WINDOW_DAYS = 5            # TODO: phase 5/6
-MAX_HOLD_DAYS = 60               # TODO: phase 5/6
-TRAILING_EMA = 20                # TODO: phase 6
+STOP_PCT_CAP = 0.05              # Phase 5: stop = tighter of (T+1 low, -5% from entry)
+TARGET_R_MULTIPLE = 1.5          # Phase 5: T1 = entry + 1.5 × (entry - stop)
+ENTRY_WINDOW_DAYS = 5            # TODO: phase 6 (entry-trigger expiry)
+MAX_HOLD_DAYS = 60               # Phase 5: T2 descriptor in message; enforced phase 6
+TRAILING_EMA = 20                # Phase 5: T2 descriptor in message; enforced phase 6
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ COHORT_WINDOW_DAYS = 7
 # ---------------------------------------------------------------------------
 # Signal tiering thresholds (BRD §3.5 FR-5.4).
 # ---------------------------------------------------------------------------
-TIER_THRESHOLDS = {              # TODO: phase 5
+TIER_THRESHOLDS = {              # Phase 5: src.pipeline.tiering.assign_tier
     "SKIP":   (0.0, 2.0),
     "WATCH":  (2.0, 2.5),
     "TAKE":   (2.5, 3.0),
@@ -131,25 +131,25 @@ TIER_THRESHOLDS = {              # TODO: phase 5
 # ---------------------------------------------------------------------------
 # Confirmation checklist thresholds (BRD §3.5 FR-5.5).
 # ---------------------------------------------------------------------------
-CONF_VOLUME_MULTIPLIER = 2.0              # TODO: phase 5
-CONF_MAX_EXTENSION_PCT = 0.12             # TODO: phase 5
-CONF_MAX_LIQUIDITY_PCT = 0.10             # TODO: phase 5
-CONF_CORPORATE_ACTION_WINDOW_DAYS = 5     # TODO: phase 5
+CONF_VOLUME_MULTIPLIER = 2.0              # Phase 5: C1 — T+1 vol ≥ 2× 30-day avg
+CONF_MAX_EXTENSION_PCT = 0.12             # Phase 5: C3 — T+1 move ≤ 12% (not extended)
+CONF_MAX_LIQUIDITY_PCT = 0.10             # Phase 5: C4 — nominal 1.0R ≤ 10% of 30d turnover
+CONF_CORPORATE_ACTION_WINDOW_DAYS = 5     # Phase 5: C5 — no split/bonus/div ex-date ±5 trading days
 
 
 # ---------------------------------------------------------------------------
 # Position sizing (BRD §3.5 FR-5.6).
 # ---------------------------------------------------------------------------
-DEFAULT_RISK_PER_TRADE_PCT = 0.01         # TODO: phase 5
-PORTFOLIO_VALUE_INR = 1_000_000           # TODO: phase 5 — update before going live
+DEFAULT_RISK_PER_TRADE_PCT = 0.01         # Phase 5: R = 1% of portfolio per trade
+PORTFOLIO_VALUE_INR = 1_000_000           # Phase 5 — update before going live
 
 
 # ---------------------------------------------------------------------------
 # Concentration limits (BRD §3.5 FR-5.7).
 # ---------------------------------------------------------------------------
-MAX_OPEN_POSITIONS = 12                   # TODO: phase 6
-MAX_PER_SECTOR = 4                        # TODO: phase 6
-MAX_PEAD_ALLOCATION_PCT = 0.25            # TODO: phase 6
+MAX_OPEN_POSITIONS = 12                   # Phase 5: concentration flag (FR-5.7)
+MAX_PER_SECTOR = 4                        # Phase 5: concentration flag (FR-5.7)
+MAX_PEAD_ALLOCATION_PCT = 0.25            # Phase 5: concentration flag (FR-5.7)
 
 
 # ---------------------------------------------------------------------------

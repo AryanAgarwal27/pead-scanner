@@ -53,6 +53,11 @@ python jobs/rank_eod.py
 python jobs/rank_eod.py --dry-run
 python jobs/rank_eod.py --as-of 2026-05-26       # historical rerun
 
+# Signal generation (Phase 5): tier + confirm + size the day's ranking, send signals:
+python jobs/generate_signals.py
+python jobs/generate_signals.py --dry-run
+python jobs/generate_signals.py --as-of 2026-05-26   # historical ranking (C2 regime approximate)
+
 # Nightly Screener cache + BSE↔NSE symbol map refresh:
 python jobs/screener_cache.py
 python jobs/screener_cache.py --symbols HDFCBANK,RELIANCE   # ad hoc subset
@@ -78,6 +83,20 @@ Before the first `rank_eod` run, ensure:
    adds `rankings`, `metrics.avg_30d_turnover_cr`, `fundamentals.listed_long_enough`.
 2. The ban-list and surveillance-list CSVs ship empty; populate them manually
    (see "Manual list maintenance" below) before the ranking is meaningful.
+
+### First-time Phase 5 setup
+
+Before the first `generate_signals` run, ensure:
+
+1. Apply [migrations/phase5_alter.sql](migrations/phase5_alter.sql) in Supabase SQL Editor —
+   adds the `signals` table (one row per filing, `UNIQUE(filing_id)`, status
+   `PENDING_ENTRY`).
+2. The `generate-signals` workflow runs at 20:45 IST, 15 min after `enrich-eod`
+   (which writes today's `metrics` + `rankings`). Running it before that, or on a
+   day with no ranking, simply sends an empty-set summary — it never errors.
+3. Set `PORTFOLIO_VALUE_INR` in [src/config.py](src/config.py) to your real
+   capital before going live — it drives the position-sizing (`R`) and the C4
+   liquidity / concentration math.
 
 ### Manual list maintenance
 

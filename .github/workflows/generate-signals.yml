@@ -1,0 +1,39 @@
+name: generate-signals
+
+on:
+  schedule:
+    # BRD §5.2 (reconciled): 20:45 IST (= 15:15 UTC) Mon-Fri — 15 min after
+    # enrich-eod (20:30 IST), so today's metrics + rankings exist. The BRD text
+    # has three conflicting send times (FR-5.2 4:30 PM, §5.2 8:45 PM, Phase 5
+    # acceptance 5:45 PM); 8:45 PM is the only slot downstream of enrich-eod.
+    - cron: '15 15 * * 1-5'
+  workflow_dispatch:
+
+concurrency:
+  group: generate-signals
+  cancel-in-progress: false
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20      # ≤25 yfinance OHLC fetches + Telegram sends
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Generate signals
+        env:
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python jobs/generate_signals.py
