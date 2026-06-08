@@ -165,8 +165,26 @@ def _select_cohort(db, run_date: date) -> list[dict[str, Any]]:
         single PostgREST embed for BSE filings. Strategy: select filings +
         metrics in one call, then bulk-load fundamentals for the resolved
         NSE tickers in a second call. Saves N+1 round-trips.
+
+    Window: anchored on `run_date`, NOT wall-clock now(). The cohort is the
+    COHORT_WINDOW_DAYS (7) IST calendar days ENDING ON run_date, inclusive —
+    so a `--as-of` historical replay queries that date's true cohort rather
+    than "the last 7 days from now". Bounds (both present):
+        upper (exclusive) = IST midnight starting the day AFTER run_date
+        lower (inclusive) = upper - COHORT_WINDOW_DAYS
+    i.e. IST dates [run_date - 6 … run_date]. filing_time is stored UTC, so we
+    build the IST day boundaries and convert to UTC for the query.
     """
-    cutoff = datetime.now(UTC) - timedelta(days=config.COHORT_WINDOW_DAYS)
+    # IST midnight starting the day after run_date (exclusive upper bound).
+    # Built directly from the date parts to avoid importing datetime.time,
+    # which would shadow the module-level `import time` used for perf_counter.
+    upper_ist = (
+        datetime(run_date.year, run_date.month, run_date.day, tzinfo=IST)
+        + timedelta(days=1)
+    )
+    lower_ist = upper_ist - timedelta(days=config.COHORT_WINDOW_DAYS)
+    upper_utc = upper_ist.astimezone(UTC)
+    lower_utc = lower_ist.astimezone(UTC)
 
     resp = (
         db.table("filings")
@@ -177,7 +195,8 @@ def _select_cohort(db, run_date: date) -> list[dict[str, Any]]:
             "metrics!inner(filing_id, sue_proxy, rev_growth_yoy, ear, "
             "vol_spike, margin_delta, avg_30d_turnover_cr)"
         )
-        .gte("filing_time", cutoff.isoformat())
+        .gte("filing_time", lower_utc.isoformat())
+        .lt("filing_time", upper_utc.isoformat())
         .order("filing_time")
         .execute()
     )

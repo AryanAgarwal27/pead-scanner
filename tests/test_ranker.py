@@ -8,11 +8,13 @@ Focus areas:
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 
+from src import config
 from src.pipeline import filterer as F
 from src.pipeline import ranker as R
+from src.utils.time_utils import IST
 
 
 def _cohort_row(filing_id: int, *, source: str, symbol: str,
@@ -103,6 +105,53 @@ class TestDedup:
         ]
         assert R._dedup_cross_source(a)[0]["filing_id"] == 1
         assert R._dedup_cross_source(b)[0]["filing_id"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cohort window anchoring (regression: --as-of must not use now())
+# ---------------------------------------------------------------------------
+
+
+class TestSelectCohortWindow:
+    def _chain_capturing_db(self) -> tuple[MagicMock, MagicMock]:
+        """A db whose filings query chain records its gte/lt bounds."""
+        db = MagicMock()
+        chain = MagicMock()
+        db.table.return_value = chain
+        chain.select.return_value = chain
+        chain.gte.return_value = chain
+        chain.lt.return_value = chain
+        chain.order.return_value = chain
+        chain.execute.return_value = MagicMock(data=[])
+        return db, chain
+
+    def test_window_anchored_on_past_run_date_not_now(self) -> None:
+        """_select_cohort for a historical run_date must query the 7 IST
+        calendar days ENDING ON that date — with both a lower and an upper
+        bound — never a now()-anchored window."""
+        db, chain = self._chain_capturing_db()
+        run_date = date(2026, 1, 15)
+
+        out = R._select_cohort(db, run_date)
+        assert out == []  # empty data → empty cohort, fundamentals branch skipped
+
+        # Upper (exclusive) = IST midnight starting 2026-01-16 = 2026-01-15 18:30 UTC.
+        # Lower (inclusive) = upper - 7 days       = 2026-01-08 18:30 UTC.
+        expected_upper = datetime(2026, 1, 16, 0, 0, tzinfo=IST).astimezone(UTC)
+        expected_lower = expected_upper - timedelta(days=config.COHORT_WINDOW_DAYS)
+
+        gte_arg = chain.gte.call_args.args
+        lt_arg = chain.lt.call_args.args
+        assert gte_arg[0] == "filing_time"
+        assert lt_arg[0] == "filing_time"
+        assert gte_arg[1] == expected_lower.isoformat()
+        assert lt_arg[1] == expected_upper.isoformat()
+
+        # Both bounds present (the bug had no upper bound at all).
+        chain.lt.assert_called_once()
+        # The bounds reflect run_date, not the current wall clock.
+        assert "2026-01-08" in gte_arg[1]
+        assert "2026-01-15" in lt_arg[1]
 
 
 # ---------------------------------------------------------------------------
