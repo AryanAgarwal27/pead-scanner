@@ -75,6 +75,41 @@ Before the first `enrich_eod` run, ensure:
    Screener fundamentals: `python -m src.sources.symbol_map refresh`. The
    `screener-cache` job will refresh this weekly thereafter.
 
+### Re-enriching rate-limited filings (Phase 3 fix)
+
+If a bulk backfill exhausted the Gemini free-tier daily quota, those filings
+fall back to the regex parser (`parser_confidence` = `low`/`failed`) and are
+**excluded from ranking** by Phase 4's confidence floor — the symptom is a tiny
+cohort and zero signals. `enrich_eod --reparse` re-attempts them with Gemini.
+
+Verified free-tier limits: `gemini-2.5-flash-lite` **1,000 RPD** / 15 RPM,
+`gemini-2.5-flash` **250 RPD** / 10 RPM (RPD resets midnight Pacific). RPD is
+the binding constraint, so re-enriching a large backlog is an intentional
+**multi-day** job — `--max-gemini-calls` (default 900) stops each run under the
+cap and the next run resumes (idempotent: fixed rows are no longer re-selected).
+
+Runbook (e.g. the late-May earnings cluster, ~2,100 filings ⇒ ~3 days):
+
+```bash
+# Smoke-test on a tiny slice first — confirm Gemini high-confidence recovers:
+python jobs/enrich_eod.py --reparse --limit 20 --dry-run
+
+# One day's throttled slice (≈900 Gemini calls); repeat daily until drained:
+python jobs/enrich_eod.py --reparse --window-days 14 --max-gemini-calls 900
+
+# Spot re-enrich specific filings (bypasses window + metrics gate):
+python jobs/enrich_eod.py --filing-id 87 --filing-id 213
+
+# After a day's batch, confirm the cohort fills out, then signals:
+python jobs/rank_eod.py --as-of 2026-05-29 --dry-run
+python jobs/generate_signals.py --as-of 2026-05-29 --dry-run
+```
+
+`--reparse` invalidates each row (NULLs `parsed_at`, deletes its `metrics` row)
+*immediately before* re-parsing it, gated behind the call budget — so if the
+budget trips mid-run, unprocessed rows are left untouched and re-selected next
+run (never orphaned).
+
 ### First-time Phase 4 setup
 
 Before the first `rank_eod` run, ensure:

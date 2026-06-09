@@ -35,6 +35,7 @@ from typing import Any
 import requests
 from pypdf import PdfReader
 
+from src import config
 from src.pipeline import metrics as M
 from src.sources import gemini_parser, regex_parser
 from src.sources import yfinance_adapter as yfa
@@ -92,40 +93,135 @@ class EnrichOutcome:
     error: str | None = None
 
 
+class _GeminiGate:
+    """Throttle + daily-call budget for Gemini dispatches (Phase 3 rate-limit fix).
+
+    Counts API CALLS across both tiers AND all retries — not filings — because
+    one filing can cost flash-lite + retries + flash + retries. `on_dispatch`
+    is handed to gemini_parser.parse_pdf and fired before every API call:
+      * spaces calls to >= 60/RPM seconds apart (respects RPM, keeps TPM sane),
+      * increments the call counter.
+    `exhausted` is checked between filings so a tripped budget stops dispatching
+    new work (a single in-flight filing may overshoot by its own retries, which
+    the 100-call headroom under the 1,000 RPD cap absorbs).
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        target_rpm: float,
+        sleep=time.sleep,
+        clock=time.monotonic,
+    ) -> None:
+        self.limit = limit
+        self.used = 0
+        self._min_interval = 60.0 / target_rpm if target_rpm > 0 else 0.0
+        self._last: float | None = None
+        self._sleep = sleep
+        self._clock = clock
+
+    @property
+    def exhausted(self) -> bool:
+        return self.used >= self.limit
+
+    def on_dispatch(self) -> None:
+        if self._min_interval > 0 and self._last is not None:
+            gap = self._clock() - self._last
+            if gap < self._min_interval:
+                self._sleep(self._min_interval - gap)
+        self._last = self._clock()
+        self.used += 1
+
+
 def enrich_pending(
-    db, *, dry_run: bool = False, limit: int | None = None
+    db,
+    *,
+    dry_run: bool = False,
+    limit: int | None = None,
+    reparse: bool = False,
+    window_days: int | None = None,
+    filing_ids: list[int] | None = None,
+    max_gemini_calls: int | None = None,
+    gate: _GeminiGate | None = None,
 ) -> list[EnrichOutcome]:
-    """Process filings within the 14-day window that lack a metrics row.
+    """Process filings that need a metrics row, with Gemini throttling.
+
+    Selection mode (mutually exclusive, checked in this order):
+        filing_ids  — exactly those filings, bypassing both the window AND the
+                      pending/metrics gate (targeted re-enrich).
+        reparse     — filings in the window whose parse is low-quality
+                      (parser_used='regex' OR parser_confidence in low/failed).
+                      Each is invalidated per-row (parsed_at NULL'd, metrics row
+                      deleted) immediately before re-parsing, so a budget trip
+                      mid-run never orphans a row — untouched targets are simply
+                      re-selected next run.
+        default     — filings within the window that have no metrics row.
 
     Args:
-        db: supabase client (from `src.db.client.get_client()`).
-        dry_run: if True, computes everything but writes nothing.
-        limit: if set, process only the first N pending filings (oldest-first
-            per filing_time). Aged-out warning logs are NOT subject to the
-            limit — operators always see the full list of stale filings.
+        db: supabase client.
+        dry_run: compute everything, write nothing (no DB writes, no Gemini-cost
+            avoidance — Gemini is still CALLED so a dry-run reflects reality).
+        limit: cap the number of filings processed (oldest-first).
+        reparse: enable the reparse selection + per-row invalidation above.
+        window_days: override ENRICH_WINDOW_DAYS for selection (reach aged-out
+            filings). Ignored when filing_ids is given.
+        filing_ids: targeted re-enrich of exactly these filing ids.
+        max_gemini_calls: daily Gemini CALL budget; defaults to
+            config.GEMINI_DAILY_CALL_BUDGET. Dispatch stops once reached.
+        gate: inject a pre-built _GeminiGate (tests); otherwise one is built
+            from max_gemini_calls + config.GEMINI_TARGET_RPM.
 
-    Returns one EnrichOutcome per filing processed. Also emits WARNING logs
-    for filings older than ENRICH_WINDOW_DAYS that still lack metrics.
+    Returns one EnrichOutcome per filing processed.
     """
     _log_aged_out(db)
 
-    pending = _select_pending(db)
-    total = len(pending)
+    if gate is None:
+        budget = (
+            max_gemini_calls
+            if max_gemini_calls is not None
+            else config.GEMINI_DAILY_CALL_BUDGET
+        )
+        gate = _GeminiGate(limit=budget, target_rpm=config.GEMINI_TARGET_RPM)
+
+    targets = _select_targets(
+        db, reparse=reparse, window_days=window_days, filing_ids=filing_ids
+    )
+    total = len(targets)
+    mode = "reparse" if reparse else ("by-id" if filing_ids else "pending")
     if limit is not None and limit < total:
-        pending = pending[:limit]
+        targets = targets[:limit]
         log.info(
-            f"enricher: {total} filings pending; --limit={limit} -> "
-            f"processing first {len(pending)} (within {ENRICH_WINDOW_DAYS}-day window)"
+            f"enricher: mode={mode} {total} candidates; --limit={limit} -> "
+            f"processing first {len(targets)} (gemini budget={gate.limit})"
         )
     else:
         log.info(
-            f"enricher: {total} filings pending (within {ENRICH_WINDOW_DAYS}-day window)"
+            f"enricher: mode={mode} {total} candidates (gemini budget={gate.limit})"
         )
-    outcomes: list[EnrichOutcome] = []
 
-    for f in pending:
+    outcomes: list[EnrichOutcome] = []
+    deferred = 0
+    for f in targets:
+        # Budget check BEFORE touching the row (so reparse never invalidates a
+        # row it then can't process — that row stays fully intact for next run).
+        if gate.exhausted:
+            deferred = total - len(outcomes) if limit is None else len(targets) - len(outcomes)
+            log.info(
+                f"enricher: Gemini call budget reached (used={gate.used}/{gate.limit}); "
+                f"stopping — {deferred} candidate(s) deferred to next run"
+            )
+            break
+
+        if reparse:
+            # Per-row invalidation (parsed_at first, then metrics) so an in-flight
+            # crash leaves the row ready for a fresh parse, never orphaned.
+            if not dry_run:
+                _invalidate_for_reparse(db, f["id"])
+            f["parsed_at"] = None  # force a fresh parse in-memory (also for dry-run)
+
         try:
-            outcomes.append(_process_one(db, f, dry_run=dry_run))
+            outcomes.append(_process_one(db, f, dry_run=dry_run, gate=gate))
         except Exception as e:  # noqa: BLE001 — never abort the batch on one bad filing
             log.exception(f"enricher: unhandled error on filing_id={f['id']}: {e}")
             outcomes.append(
@@ -139,6 +235,11 @@ def enrich_pending(
                     error=str(e),
                 )
             )
+
+    log.info(
+        f"enricher: processed={len(outcomes)} gemini_calls_used={gate.used}/{gate.limit} "
+        f"deferred={deferred}"
+    )
     return outcomes
 
 
@@ -147,7 +248,7 @@ def enrich_pending(
 # ---------------------------------------------------------------------------
 
 
-def _process_one(db, f: dict, *, dry_run: bool) -> EnrichOutcome:
+def _process_one(db, f: dict, *, dry_run: bool, gate: _GeminiGate | None = None) -> EnrichOutcome:
     filing_id: int = f["id"]
     symbol: str = f["symbol"]
     source: str = f["source"]
@@ -159,7 +260,7 @@ def _process_one(db, f: dict, *, dry_run: bool) -> EnrichOutcome:
 
     # ---- Parse (cached on filings.parsed_at) -------------------------------
     if f.get("parsed_at") is None:
-        parsed = _parse_filing(f, quarter)
+        parsed = _parse_filing(f, quarter, gate=gate)
         if not dry_run:
             _persist_parse(db, filing_id, parsed)
     else:
@@ -249,7 +350,7 @@ def _process_one(db, f: dict, *, dry_run: bool) -> EnrichOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _parse_filing(f: dict, quarter: str) -> ParsedFiling:
+def _parse_filing(f: dict, quarter: str, *, gate: _GeminiGate | None = None) -> ParsedFiling:
     """Download + parse via Gemini→regex fallback chain.
 
     Returns a ParsedFiling. If everything fails, returns one with
@@ -266,17 +367,22 @@ def _parse_filing(f: dict, quarter: str) -> ParsedFiling:
         log.warning(f"  PDF download failed ({url}): {e}")
         return _failed_parsed(f"pdf download failed: {e}")
 
-    # Gemini size gate — large PDFs go straight to regex.
+    # Gemini size gate — large PDFs go straight to regex (no Gemini call, so the
+    # call budget is untouched).
     if _exceeds_gemini_gate(pdf_bytes):
         log.info(
             f"  PDF exceeds Gemini gate ({len(pdf_bytes):,}B) — going straight to regex"
         )
         return regex_parser.parse_pdf(pdf_bytes)
 
-    # Gemini tier (Flash-Lite -> Flash internally).
+    # Gemini tier (Flash-Lite -> Flash internally), throttled + budget-counted
+    # via the gate's on_dispatch hook (fired before every API call).
+    on_dispatch = gate.on_dispatch if gate is not None else None
     t0 = time.perf_counter()
     try:
-        parsed = gemini_parser.parse_pdf(pdf_bytes, expected_quarter=quarter)
+        parsed = gemini_parser.parse_pdf(
+            pdf_bytes, expected_quarter=quarter, on_dispatch=on_dispatch
+        )
         log.info(
             f"  Gemini OK in {int((time.perf_counter() - t0) * 1000)}ms "
             f"(parser={parsed.parser_used}, confidence={parsed.confidence})"
@@ -420,28 +526,87 @@ def __ts(d: date):  # tiny pandas-Timestamp helper kept local
 # ---------------------------------------------------------------------------
 
 
-def _select_pending(db) -> list[dict]:
-    """Return filings within the 14-day window whose metrics row is missing.
+# Filing columns the parse/metric pipeline needs (shared across selection modes).
+_FILING_SELECT_COLS = (
+    "id, symbol, source, quarter, filing_time, filing_url, parsed_at, "
+    "revenue_cr, pat_cr, eps, opm_pct, revenue_yoy_pct, pat_yoy_pct, "
+    "is_consolidated, has_exceptional_items, parser_used, parser_confidence"
+)
+
+
+def _select_targets(
+    db,
+    *,
+    reparse: bool,
+    window_days: int | None,
+    filing_ids: list[int] | None,
+) -> list[dict]:
+    """Dispatch to the right selection mode. See enrich_pending for semantics."""
+    if filing_ids:
+        return _select_by_ids(db, filing_ids)
+    if reparse:
+        return _select_reparse(db, window_days=window_days)
+    return _select_pending(db, window_days=window_days)
+
+
+def _select_pending(db, *, window_days: int | None = None) -> list[dict]:
+    """Return filings within the window whose metrics row is missing.
 
     Approach: select recent filings, join in metrics (left), keep rows with
     no metrics row.
     """
-    cutoff_iso = (datetime.now(UTC) - timedelta(days=ENRICH_WINDOW_DAYS)).isoformat()
-    # Fetch filings + their metrics row (if any) in one trip.
+    days = window_days if window_days is not None else ENRICH_WINDOW_DAYS
+    cutoff_iso = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     resp = (
         db.table("filings")
-        .select(
-            "id, symbol, source, quarter, filing_time, filing_url, parsed_at, "
-            "revenue_cr, pat_cr, eps, opm_pct, revenue_yoy_pct, pat_yoy_pct, "
-            "is_consolidated, has_exceptional_items, parser_used, parser_confidence, "
-            "metrics(filing_id)"
-        )
+        .select(_FILING_SELECT_COLS + ", metrics(filing_id)")
         .gte("filing_time", cutoff_iso)
         .order("filing_time")
         .execute()
     )
     rows = resp.data or []
     return [r for r in rows if not r.get("metrics")]
+
+
+def _select_reparse(db, *, window_days: int | None = None) -> list[dict]:
+    """Return filings in the window whose parse is low-quality and should be
+    re-attempted with Gemini: parser_used='regex' OR parser_confidence in
+    ('low','failed'). These already have parsed_at + a metrics row; the caller
+    invalidates each per-row immediately before re-parsing.
+    """
+    days = window_days if window_days is not None else ENRICH_WINDOW_DAYS
+    cutoff_iso = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    resp = (
+        db.table("filings")
+        .select(_FILING_SELECT_COLS)
+        .gte("filing_time", cutoff_iso)
+        .or_("parser_used.eq.regex,parser_confidence.in.(low,failed)")
+        .order("filing_time")
+        .execute()
+    )
+    return resp.data or []
+
+
+def _select_by_ids(db, filing_ids: list[int]) -> list[dict]:
+    """Return exactly the requested filings, bypassing window + metrics gate."""
+    resp = (
+        db.table("filings")
+        .select(_FILING_SELECT_COLS)
+        .in_("id", filing_ids)
+        .order("filing_time")
+        .execute()
+    )
+    return resp.data or []
+
+
+def _invalidate_for_reparse(db, filing_id: int) -> None:
+    """Per-row reparse invalidation. Order matters for crash-safety: NULL
+    parsed_at FIRST (so a fresh Gemini parse is forced even if the next step
+    fails), THEN delete the metrics row (so a stale metric never outlives its
+    parse). A row interrupted between/after these is re-selected next run by
+    both _select_reparse (still regex/low) and _select_pending (no metrics)."""
+    db.table("filings").update({"parsed_at": None}).eq("id", filing_id).execute()
+    db.table("metrics").delete().eq("filing_id", filing_id).execute()
 
 
 def _log_aged_out(db) -> None:

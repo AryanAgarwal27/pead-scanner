@@ -204,8 +204,13 @@ def test_no_state_leak_between_iterations(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.setattr(enricher, "_download_pdf", fake_download_pdf)
 
-    # Gemini parser: distinct revenue / PAT per company.
-    def fake_parse_pdf(pdf_bytes: bytes, expected_quarter: str) -> ParsedFiling:
+    # Gemini parser: distinct revenue / PAT per company. Accept the throttle/
+    # budget kwargs the enricher now threads through (on_dispatch/sleep/ceiling).
+    def fake_parse_pdf(
+        pdf_bytes: bytes, expected_quarter: str, *, on_dispatch=None, **_kw
+    ) -> ParsedFiling:
+        if on_dispatch is not None:
+            on_dispatch()  # mimic a single real API dispatch so the gate counts it
         if pdf_bytes == b"%PDF-SETL":
             return ParsedFiling(
                 revenue_cr=100.0, pat_cr=10.0, eps=1.0, opm_pct=15.0,

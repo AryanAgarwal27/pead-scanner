@@ -155,6 +155,27 @@ MAX_PEAD_ALLOCATION_PCT = 0.25            # Phase 5: concentration flag (FR-5.7)
 # ---------------------------------------------------------------------------
 # Gemini PDF parser (BRD §3.3 FR-3.4 / FR-3.5).
 # ---------------------------------------------------------------------------
-GEMINI_PRIMARY_MODEL = "gemini-2.5-flash-lite"   # TODO: phase 3
-GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"       # TODO: phase 3
-GEMINI_MAX_RETRIES = 2                           # TODO: phase 3
+GEMINI_PRIMARY_MODEL = "gemini-2.5-flash-lite"   # 15 RPM / 1,000 RPD (free tier)
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"       # 10 RPM / 250 RPD (free tier, separate bucket)
+GEMINI_MAX_RETRIES = 2                           # legacy (unused by the backoff loop below)
+
+# ---------------------------------------------------------------------------
+# Gemini rate-limit hardening (Phase 3 fix — prevents the 429-cascade that
+# demoted ~94% of the backfill to regex). Verified free-tier limits (2026-06):
+# flash-lite 15 RPM / 250k TPM / 1,000 RPD; flash 10 RPM / 250k TPM / 250 RPD.
+# RPD (1,000/day) is the binding constraint for bulk re-enrichment, so a large
+# re-run is inherently multi-day. These knobs keep a burst under quota and turn
+# a transient 429 into a wait instead of a permanent regex demotion.
+# ---------------------------------------------------------------------------
+# ≤ flash-lite's 15 RPM, with headroom → 6s min spacing between calls:
+GEMINI_TARGET_RPM = 10
+# max dispatch attempts per tier (1 initial + up to 3 retries) on 429/5xx:
+GEMINI_RETRY_MAX_ATTEMPTS = 4
+# exponential base (seconds) when no Retry-After is provided:
+GEMINI_BACKOFF_BASE_SECONDS = 2
+# cap on any single backoff wait (seconds):
+GEMINI_BACKOFF_MAX_WAIT_SECONDS = 60
+# per-filing cumulative sleep ceiling → defer the row to the next run:
+GEMINI_MAX_TOTAL_BACKOFF_SECONDS = 90
+# stop after N actual Gemini CALLS (all tiers + retries); 100 under the 1,000 RPD cap:
+GEMINI_DAILY_CALL_BUDGET = 900

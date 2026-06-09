@@ -9,10 +9,15 @@ Extracts standardized financial numbers from quarterly result PDFs filed on
 NSE/BSE. Fallback chain (FR-3.5):
 
     Gemini 2.5 Flash-Lite   (primary, separate quota bucket)
-        ↓ on 429 / 5xx / pydantic.ValidationError / column-validation failure
+        ↓ retry-with-backoff on transient 429 / 5xx (Retry-After aware), then
+        ↓ demote on exhausted retries / ValidationError / column-validation
     Gemini 2.5 Flash        (secondary, separate quota bucket)
-        ↓ on 429 / 5xx / pydantic.ValidationError / column-validation failure
+        ↓ same retry-then-demote behaviour
     regex parser            (last resort — see src.sources.regex_parser)
+
+A per-filing cumulative backoff ceiling caps total sleep across both tiers, so
+a row stuck behind a repeated Retry-After is deferred to the next run rather
+than burning the job's wall clock. See parse_pdf for the throttle/budget hook.
 
 The caller (src.pipeline.enricher) decides whether to invoke the regex tier —
 this module surfaces a `ParseFailure` exception with the last error so the
@@ -48,6 +53,8 @@ Hallucination defenses (in order of strength):
 from __future__ import annotations
 
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
 from typing import Literal
@@ -284,51 +291,167 @@ def _get_client() -> genai.Client:
 _RETRY_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 
 
-def parse_pdf(pdf_bytes: bytes, expected_quarter: str) -> ParsedFiling:
+def parse_pdf(
+    pdf_bytes: bytes,
+    expected_quarter: str,
+    *,
+    on_dispatch: Callable[[], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    max_total_backoff_seconds: float | None = None,
+) -> ParsedFiling:
     """Parse a quarterly-result PDF via Gemini, with Flash-Lite → Flash fallback.
+
+    Each tier retries on transient 429/5xx with backoff BEFORE demoting to the
+    next tier (Phase 3 rate-limit fix): a momentary rate limit becomes a wait,
+    not a permanent regex demotion. Validation / column-validation failures are
+    deterministic, so they demote immediately (no retry).
 
     Args:
         pdf_bytes: raw PDF content.
         expected_quarter: the quarter label this filing should be reporting
             (e.g. 'Q4-FY26'). Used to validate that Gemini selected the
             correct column (not a year-end column, not a wrong quarter).
+        on_dispatch: called immediately before EACH Gemini API dispatch (every
+            tier attempt AND every retry). The enricher passes a hook that
+            counts the call against the daily RPD budget — so the budget counts
+            actual API CALLS across both tiers and all retries, not filings.
+        sleep: injectable sleeper (tests pass a fake to capture backoff waits).
+        max_total_backoff_seconds: per-filing cumulative backoff ceiling. Once
+            total sleep across all tiers/retries would exceed this, stop backing
+            off and demote/give up — deferring the row to the next run rather
+            than burning wall-clock behind a repeated Retry-After. Defaults to
+            config.GEMINI_MAX_TOTAL_BACKOFF_SECONDS.
 
     Raises:
-        ParseFailure: if BOTH Gemini tiers fail (HTTP, schema, OR column
-            validation). Caller should then try regex_parser.parse_pdf.
+        ParseFailure: if BOTH Gemini tiers fail (HTTP, schema, column
+            validation, or backoff-ceiling deferral). Caller should then try
+            regex_parser.parse_pdf.
     """
+    if max_total_backoff_seconds is None:
+        max_total_backoff_seconds = config.GEMINI_MAX_TOTAL_BACKOFF_SECONDS
     last_error: Exception | None = None
+    total_slept = 0.0
 
     for model_name, parser_tag in (
         (config.GEMINI_PRIMARY_MODEL, "gemini-flash-lite"),
         (config.GEMINI_FALLBACK_MODEL, "gemini-flash"),
     ):
-        try:
-            return _call_gemini(pdf_bytes, expected_quarter, model_name, parser_tag)
-        except (genai_errors.ClientError, genai_errors.ServerError) as e:
-            last_error = e
-            status = getattr(e, "code", None) or getattr(e, "status_code", None)
-            if status in _RETRY_HTTP_CODES:
-                log.warning(f"[{model_name}] HTTP {status} — falling back to next tier")
-                continue
-            log.error(f"[{model_name}] non-retriable HTTP {status}: {e}")
-            raise ParseFailure(f"{model_name}: {e}", last_error=e) from e
-        except ValidationError as e:
-            last_error = e
-            log.warning(f"[{model_name}] Pydantic validation failed — falling back: {e}")
-            continue
-        except _ColumnValidationFailure as e:
-            last_error = e
-            log.warning(f"[{model_name}] column validation failed — falling back: {e}")
-            continue
-        except Exception as e:  # noqa: BLE001 — last-resort log + continue
-            last_error = e
-            log.exception(f"[{model_name}] unexpected error — falling back")
-            continue
+        for attempt in range(1, config.GEMINI_RETRY_MAX_ATTEMPTS + 1):
+            if on_dispatch is not None:
+                on_dispatch()
+            try:
+                return _call_gemini(pdf_bytes, expected_quarter, model_name, parser_tag)
+            except (genai_errors.ClientError, genai_errors.ServerError) as e:
+                last_error = e
+                status = getattr(e, "code", None) or getattr(e, "status_code", None)
+                if status not in _RETRY_HTTP_CODES:
+                    log.error(f"[{model_name}] non-retriable HTTP {status}: {e}")
+                    raise ParseFailure(f"{model_name}: {e}", last_error=e) from e
+                if attempt >= config.GEMINI_RETRY_MAX_ATTEMPTS:
+                    log.warning(
+                        f"[{model_name}] HTTP {status} — {attempt} attempts exhausted, demoting tier"
+                    )
+                    break
+                wait = _backoff_wait(e, attempt)
+                if total_slept + wait > max_total_backoff_seconds:
+                    log.warning(
+                        f"[{model_name}] HTTP {status} — per-filing backoff ceiling "
+                        f"({max_total_backoff_seconds:.0f}s) reached after {total_slept:.0f}s; "
+                        f"demoting without further wait (defer to next run)"
+                    )
+                    break
+                log.warning(
+                    f"[{model_name}] HTTP {status} — backoff {wait:.0f}s "
+                    f"(attempt {attempt}/{config.GEMINI_RETRY_MAX_ATTEMPTS})"
+                )
+                sleep(wait)
+                total_slept += wait
+            except ValidationError as e:
+                last_error = e
+                log.warning(f"[{model_name}] Pydantic validation failed — demoting: {e}")
+                break
+            except _ColumnValidationFailure as e:
+                last_error = e
+                log.warning(f"[{model_name}] column validation failed — demoting: {e}")
+                break
+            except Exception as e:  # noqa: BLE001 — last-resort log + demote
+                last_error = e
+                log.exception(f"[{model_name}] unexpected error — demoting")
+                break
 
     raise ParseFailure(
         "Both Gemini tiers (Flash-Lite + Flash) failed", last_error=last_error
     )
+
+
+# ---------------------------------------------------------------------------
+# Backoff helpers — prefer the server's Retry-After / RetryInfo, else exponential.
+# ---------------------------------------------------------------------------
+
+
+def _backoff_wait(error: Exception, attempt: int) -> float:
+    """Seconds to wait before the next retry. Server-suggested delay wins;
+    otherwise exponential (base × 2^(attempt-1)). Capped at the per-wait max."""
+    server = _retry_after_seconds(error)
+    wait = server if server is not None else config.GEMINI_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+    return min(wait, config.GEMINI_BACKOFF_MAX_WAIT_SECONDS)
+
+
+def _retry_after_seconds(error: Exception) -> float | None:
+    """Extract a server-suggested retry delay from a genai error, if present.
+
+    Checks (1) the HTTP `Retry-After` header on the underlying response, then
+    (2) Google's `RetryInfo.retryDelay` (e.g. '57s') in the error details body.
+    Returns None if neither is available/parseable (caller uses exponential).
+    """
+    resp = getattr(error, "response", None)
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        try:
+            ra = headers.get("Retry-After") or headers.get("retry-after")
+        except AttributeError:
+            ra = None
+        secs = _parse_retry_after_value(ra)
+        if secs is not None:
+            return secs
+
+    for item in _iter_error_detail_items(getattr(error, "details", None)):
+        if isinstance(item, dict) and "RetryInfo" in str(item.get("@type", "")):
+            secs = _parse_retry_after_value(item.get("retryDelay"))
+            if secs is not None:
+                return secs
+    return None
+
+
+def _iter_error_detail_items(details: object):
+    """Yield detail dicts from a genai error 'details' payload, which may be
+    {'error': {'details': [...]}}, {'details': [...]}, or a bare list."""
+    if isinstance(details, dict):
+        err = details.get("error")
+        if isinstance(err, dict) and isinstance(err.get("details"), list):
+            yield from err["details"]
+        if isinstance(details.get("details"), list):
+            yield from details["details"]
+    elif isinstance(details, list):
+        yield from details
+
+
+def _parse_retry_after_value(value: object) -> float | None:
+    """Parse a Retry-After-style value: numeric seconds (57 / '57') or a Google
+    duration string ('57s', '1.5s'). Returns float seconds, or None if absent
+    or non-numeric (e.g. an HTTP-date form we don't handle)."""
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value) if value >= 0 else None
+    s = str(value).strip().lower()
+    if s.endswith("s"):
+        s = s[:-1]
+    try:
+        secs = float(s)
+    except ValueError:
+        return None
+    return secs if secs >= 0 else None
 
 
 # ---------------------------------------------------------------------------

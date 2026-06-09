@@ -10,9 +10,18 @@ Runs at 20:30 IST (15:00 UTC) Mon–Fri. Processes every filing in the
 
 Idempotent — re-running picks up only filings still missing metrics.
 
+Re-enrichment (Phase 3 rate-limit fix): when a bulk backfill exhausted the
+Gemini free-tier RPD and demoted filings to regex (confidence low/failed,
+excluded by Phase 4), use --reparse to re-attempt them with Gemini. Runs are
+throttled and bounded by a daily call budget, so a large backlog is an
+intentional multi-day grind (see README "Re-enriching rate-limited filings").
+
 Usage:
     python jobs/enrich_eod.py
     python jobs/enrich_eod.py --dry-run
+    python jobs/enrich_eod.py --reparse --window-days 14          # re-attempt regex/low/failed
+    python jobs/enrich_eod.py --reparse --limit 900               # one day's throttled slice
+    python jobs/enrich_eod.py --filing-id 87 --filing-id 213      # targeted re-enrich
 """
 
 from __future__ import annotations
@@ -40,17 +49,69 @@ def main() -> int:
         type=int,
         default=None,
         help=(
-            "Process only the first N pending filings (oldest-first). "
+            "Process only the first N candidates (oldest-first). "
             "Use for incremental backfill validation before committing to a full run. "
-            "Default: process all."
+            "Default: process all (still bounded by --max-gemini-calls)."
+        ),
+    )
+    parser.add_argument(
+        "--reparse",
+        action="store_true",
+        help=(
+            "Re-attempt filings whose parse is low-quality (parser_used='regex' "
+            "OR parser_confidence in low/failed) within the window. Each is "
+            "invalidated (parsed_at NULL'd, metrics row deleted) just before "
+            "re-parsing — a budget trip mid-run never orphans a row."
+        ),
+    )
+    parser.add_argument(
+        "--window-days",
+        type=int,
+        default=None,
+        help=(
+            f"Override the selection window (default {None} -> "
+            "enricher's 14-day window). Use to reach aged-out filings."
+        ),
+    )
+    parser.add_argument(
+        "--filing-id",
+        type=int,
+        action="append",
+        dest="filing_ids",
+        default=None,
+        help=(
+            "Re-enrich exactly this filing id, bypassing the window AND the "
+            "metrics gate. Repeatable: --filing-id 87 --filing-id 213."
+        ),
+    )
+    parser.add_argument(
+        "--max-gemini-calls",
+        type=int,
+        default=None,
+        help=(
+            "Daily Gemini CALL budget (counts calls across both tiers + retries, "
+            "not filings). Dispatch stops once reached; remaining candidates "
+            "resume next run. Default: config.GEMINI_DAILY_CALL_BUDGET (900)."
         ),
     )
     args = parser.parse_args()
 
     db = get_client()
-    log.info(f"enrich-eod starting (dry_run={args.dry_run}, limit={args.limit})")
+    log.info(
+        f"enrich-eod starting (dry_run={args.dry_run}, limit={args.limit}, "
+        f"reparse={args.reparse}, window_days={args.window_days}, "
+        f"filing_ids={args.filing_ids}, max_gemini_calls={args.max_gemini_calls})"
+    )
 
-    outcomes = enrich_pending(db, dry_run=args.dry_run, limit=args.limit)
+    outcomes = enrich_pending(
+        db,
+        dry_run=args.dry_run,
+        limit=args.limit,
+        reparse=args.reparse,
+        window_days=args.window_days,
+        filing_ids=args.filing_ids,
+        max_gemini_calls=args.max_gemini_calls,
+    )
 
     # Summary
     by_parser: Counter[str] = Counter()
