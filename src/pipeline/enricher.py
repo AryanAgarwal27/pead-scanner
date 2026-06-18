@@ -259,10 +259,11 @@ def _process_one(db, f: dict, *, dry_run: bool, gate: _GeminiGate | None = None)
     log.info(f"enricher: processing filing_id={filing_id} {symbol} ({source}) {quarter}")
 
     # ---- Parse (cached on filings.parsed_at) -------------------------------
-    if f.get("parsed_at") is None:
+    # NOTE: persistence is deferred until AFTER the Z-CHECK below, so a tripped
+    # check can downgrade confidence before the row is written.
+    fresh_parse = f.get("parsed_at") is None
+    if fresh_parse:
         parsed = _parse_filing(f, quarter, gate=gate)
-        if not dry_run:
-            _persist_parse(db, filing_id, parsed)
     else:
         parsed = _parsed_from_filing_row(f)
         log.info(
@@ -278,8 +279,27 @@ def _process_one(db, f: dict, *, dry_run: bool, gate: _GeminiGate | None = None)
     elif not nse_ticker:
         log.info(f"  no NSE ticker for {symbol} ({source}) — SUE/Margin_Delta will be NULL")
 
-    # ---- Z-CHECK (Mod 2 instrumentation) ----------------------------------
+    # ---- Z-CHECK (Mod 2 instrumentation + BUG 3 confidence guard) ---------
     z_tripped = _z_check(filing_id, symbol, parsed, fundamentals)
+    # A tripped Z-CHECK means the extracted revenue/PAT disagrees by an order of
+    # magnitude with Screener — almost always a standalone-vs-consolidated
+    # table-selection error (e.g. MCLOUD standalone 23.7cr vs consolidated
+    # 206cr), not a true surprise. At high/medium confidence such a row would
+    # clear Phase 4's {high,medium} floor and feed a bogus signal, so downgrade
+    # it to 'low' (which the floor excludes). The downgrade is persisted with
+    # the fresh parse below.
+    if z_tripped and parsed.confidence in ("high", "medium"):
+        log.warning(
+            f"[WARNING] enricher: Z-CHECK downgrading filing_id={filing_id} "
+            f"confidence {parsed.confidence} -> low (numbers disagree with Screener; "
+            f"likely standalone/consolidated mismatch)"
+        )
+        parsed.confidence = "low"
+        parsed.notes = f"{parsed.notes or ''} [z-check downgrade]".strip()
+
+    # ---- Persist the (possibly downgraded) parse --------------------------
+    if fresh_parse and not dry_run:
+        _persist_parse(db, filing_id, parsed)
 
     # ---- Price data (yfinance) --------------------------------------------
     pw = yfa.fetch_ohlcv(symbol, source, filing_date)

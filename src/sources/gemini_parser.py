@@ -480,7 +480,15 @@ def _call_gemini(
             response_mime_type="application/json",
             response_schema=GeminiResponse,
             temperature=0.0,
-            max_output_tokens=1024,
+            # Gemini 2.5 models spend max_output_tokens on internal "thinking"
+            # tokens. At the old 1024 cap, gemini-2.5-flash (the fallback tier)
+            # burned the budget thinking and truncated the JSON mid-string
+            # ("EOF while parsing"), so the fallback could never rescue a
+            # primary-tier miss. Disable thinking — this is deterministic
+            # structured extraction at temp=0, not a reasoning task — and give
+            # the JSON ample headroom.
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            max_output_tokens=2048,
         ),
     )
 
