@@ -122,6 +122,7 @@ class TestSelectCohortWindow:
         chain.gte.return_value = chain
         chain.lt.return_value = chain
         chain.order.return_value = chain
+        chain.range.return_value = chain
         chain.execute.return_value = MagicMock(data=[])
         return db, chain
 
@@ -152,6 +153,39 @@ class TestSelectCohortWindow:
         # The bounds reflect run_date, not the current wall clock.
         assert "2026-01-08" in gte_arg[1]
         assert "2026-01-15" in lt_arg[1]
+
+    def test_cohort_paginates_past_1000_row_cap(self, monkeypatch) -> None:
+        """A dense window with >1000 filings-with-metrics must be fetched in
+        full, not truncated to PostgREST's 1000-row response cap. Regression:
+        a full first page followed by a short page → both are concatenated and
+        every row survives."""
+        # Resolve every ticker to None so the fundamentals second query is
+        # skipped — this test isolates the filings pagination only.
+        monkeypatch.setattr(R, "to_nse_ticker", lambda *_a, **_k: None)
+
+        def _raw(i: int) -> dict:
+            return {
+                "id": i, "symbol": f"S{i}", "company_name": f"C{i}",
+                "quarter": "Q4-FY26", "filing_time": "2026-05-28T10:00:00+00:00",
+                "source": "BSE", "parser_confidence": "high",
+                "has_exceptional_items": False, "parsed_at": "2026-05-29T00:00:00+00:00",
+                "revenue_cr": 100.0, "pat_cr": 10.0, "opm_pct": 12.0,
+                "metrics": [{"filing_id": i, "sue_proxy": 1.0, "rev_growth_yoy": 0.1,
+                             "ear": 0.02, "vol_spike": 1.5, "margin_delta": 0.5,
+                             "avg_30d_turnover_cr": 5.0}],
+            }
+
+        db, chain = self._chain_capturing_db()
+        page0 = [_raw(i) for i in range(1000)]
+        page1 = [_raw(i) for i in range(1000, 1042)]
+        chain.execute.side_effect = [MagicMock(data=page0), MagicMock(data=page1)]
+
+        out = R._select_cohort(db, date(2026, 6, 1))
+        assert len(out) == 1042                      # full set, not capped at 1000
+        # Two filings pages fetched (short second page stops the loop).
+        assert chain.range.call_count == 2
+        assert chain.range.call_args_list[0].args == (0, 999)
+        assert chain.range.call_args_list[1].args == (1000, 1999)
 
 
 # ---------------------------------------------------------------------------

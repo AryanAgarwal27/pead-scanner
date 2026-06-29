@@ -42,6 +42,11 @@ log = get_logger(__name__)
 # here so dedup doesn't depend on list-index lookups.
 _SOURCE_PRIORITY: dict[str, int] = {"NSE": 0, "BSE": 1, "TRENDLYNE": 2}
 
+# Safety cap on cohort pagination (1000 rows/page). 20 pages = 20k filings in a
+# single 7-day window — far beyond any real result week — so hitting it means a
+# bad window, not a legitimately huge cohort.
+_COHORT_MAX_PAGES = 20
+
 
 @dataclass
 class RankSummary:
@@ -186,21 +191,44 @@ def _select_cohort(db, run_date: date) -> list[dict[str, Any]]:
     upper_utc = upper_ist.astimezone(UTC)
     lower_utc = lower_ist.astimezone(UTC)
 
-    resp = (
-        db.table("filings")
-        .select(
-            "id, symbol, company_name, quarter, filing_time, source, "
-            "parser_confidence, has_exceptional_items, "
-            "parsed_at, revenue_cr, pat_cr, opm_pct, "
-            "metrics!inner(filing_id, sue_proxy, rev_growth_yoy, ear, "
-            "vol_spike, margin_delta, avg_30d_turnover_cr)"
-        )
-        .gte("filing_time", lower_utc.isoformat())
-        .lt("filing_time", upper_utc.isoformat())
-        .order("filing_time")
-        .execute()
+    select_cols = (
+        "id, symbol, company_name, quarter, filing_time, source, "
+        "parser_confidence, has_exceptional_items, "
+        "parsed_at, revenue_cr, pat_cr, opm_pct, "
+        "metrics!inner(filing_id, sue_proxy, rev_growth_yoy, ear, "
+        "vol_spike, margin_delta, avg_30d_turnover_cr)"
     )
-    rows = resp.data or []
+    # Paginate: PostgREST caps a single response at 1000 rows. A dense result
+    # week (Q4 season puts >1,000 filings-with-metrics in the trailing 7 days)
+    # would otherwise silently keep only the OLDEST 1000 by filing_time —
+    # dropping high/medium filings beyond the cap and shrinking the cohort the
+    # z-scores are normalized within. Fetch every page until one comes back
+    # short. Ordered by (filing_time, id) so the id tiebreaker makes paging
+    # stable across rows sharing a filing_time.
+    rows: list[dict[str, Any]] = []
+    page_size = 1000
+    for page in range(_COHORT_MAX_PAGES):
+        lo = page * page_size
+        resp = (
+            db.table("filings")
+            .select(select_cols)
+            .gte("filing_time", lower_utc.isoformat())
+            .lt("filing_time", upper_utc.isoformat())
+            .order("filing_time")
+            .order("id")
+            .range(lo, lo + page_size - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+    else:
+        log.warning(
+            f"ranker: cohort pagination hit the {_COHORT_MAX_PAGES}-page cap "
+            f"({_COHORT_MAX_PAGES * page_size} rows) for run_date={run_date}; "
+            "cohort may be truncated — investigate window size"
+        )
 
     # Bulk-load fundamentals for every resolvable NSE ticker in the cohort.
     nse_tickers: set[str] = set()
