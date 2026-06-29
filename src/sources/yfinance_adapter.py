@@ -286,6 +286,68 @@ def fetch_signal_window(
     return None
 
 
+def fetch_ohlc_range(
+    filing_symbol: str, source: str, start: date, end: date
+) -> SignalWindow | None:
+    """Fetch raw OHLC + corporate actions over an explicit [start, end) range.
+
+    Phase 6's position tracker needs a much wider post-filing window than
+    fetch_signal_window's fixed ±buffer (a 60-trading-day hold ≈ 90 calendar
+    days), plus ~20-EMA lookback before T+1. Same symbol resolution / .NS↔.BO
+    fallback as fetch_signal_window. Returns None if no symbol resolves or both
+    candidates return empty.
+    """
+    preferred, fallback = resolve_yf_symbol(filing_symbol, source)
+    if preferred is None:
+        log.warning(
+            f"yfinance(range): no symbol for filing_symbol={filing_symbol!r} source={source}"
+        )
+        return None
+    for candidate in (preferred, fallback):
+        if candidate is None:
+            continue
+        df = _download_range(candidate, start, end)
+        if df is None or df.empty:
+            log.info(f"yfinance(range): {candidate} empty for [{start}, {end})")
+            continue
+        return SignalWindow(symbol_used=candidate, df=df)
+    log.warning(
+        f"yfinance(range): no OHLC for filing_symbol={filing_symbol!r} source={source} "
+        f"(tried {preferred}, {fallback})"
+    )
+    return None
+
+
+def _download_range(symbol: str, start: date, end: date) -> pd.DataFrame | None:
+    """Raw OHLC + actions for an explicit date range. Mirrors _download_full's
+    column handling but takes caller-supplied bounds (Phase 6 tracker)."""
+    try:
+        df = yf.download(
+            symbol,
+            start=start.isoformat(),
+            end=end.isoformat(),
+            progress=False,
+            auto_adjust=False,
+            actions=True,
+            threads=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"yfinance(range): {symbol} download exception: {e}")
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    keep = [
+        c
+        for c in ("Open", "High", "Low", "Close", "Volume", "Dividends", "Stock Splits")
+        if c in df.columns
+    ]
+    if "High" not in keep or "Low" not in keep or "Close" not in keep:
+        return None
+    return df[keep].dropna(subset=["High", "Low", "Close"])
+
+
 def candle_on_or_after(df: pd.DataFrame, target: date) -> dict[str, float] | None:
     """OHLC of the first trading day on or after `target` (the T+1 candle).
 

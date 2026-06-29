@@ -181,3 +181,37 @@ def format_signal_summary(summary: Any) -> str:
     else:
         lines.append("_No concentration limits breached._")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — daily position-tracker summary (FR-6.4)
+# ---------------------------------------------------------------------------
+
+
+def _pct_or_dash(v: float | None) -> str:
+    """Render a P&L fraction (0.034 → '+3.4%'). None → em dash."""
+    return "—" if v is None else f"{v * 100:+.1f}%"
+
+
+def format_position_summary(summary: Any) -> str:
+    """Render the daily tracker summary (BRD §3.6 FR-6.4): open count, today's
+    P&L, MTD P&L, and hit rate over the last 50 closed positions.
+
+    `summary` is a TrackSummary (duck-typed to avoid importing the tracker).
+    P&L figures are the MEAN per-position realized return of the relevant
+    closed cohort (size-agnostic %), not a portfolio-weighted ₹ figure.
+    """
+    hit = getattr(summary, "hit_rate", None)
+    hit_str = "—" if hit is None else f"{hit * 100:.0f}% (n={summary.hit_rate_n})"
+    lines = [
+        f"📈 *PEAD Positions — {summary.run_date.isoformat()}*",
+        "",
+        f"Open: *{summary.open_count}*   "
+        f"(closed today: {summary.newly_closed}, expired: {summary.newly_expired})",
+        f"Today's P&L (avg/closed): {_pct_or_dash(getattr(summary, 'today_pnl_pct', None))}",
+        f"MTD P&L (avg/closed):     {_pct_or_dash(getattr(summary, 'mtd_pnl_pct', None))}",
+        f"Hit rate (last 50):       {hit_str}",
+    ]
+    if getattr(summary, "errors", 0):
+        lines.append(f"⚠️ _{summary.errors} signal(s) errored — see logs._")
+    return "\n".join(lines)

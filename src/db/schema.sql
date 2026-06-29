@@ -1,11 +1,9 @@
--- Canonical Supabase schema for pead-scanner (Phases 0–5).
+-- Canonical Supabase schema for pead-scanner (Phases 0–6).
 -- Idempotent — safe to apply to an existing database.
 -- This file mirrors BRD §6 and is the single source of truth in code.
 --
 -- For applying phase deltas to a DB that already has the prior-phase tables,
 -- use migrations/phaseN_alter.sql — those files contain ONLY the deltas.
---
--- Future phases (6) will add: positions (§6.4).
 
 ------------------------------------------------------------------------------
 -- §6.1 filings — one row per quarterly result filing (deduped by symbol+quarter)
@@ -154,3 +152,26 @@ CREATE INDEX IF NOT EXISTS signals_status_idx
     ON signals (status);
 CREATE INDEX IF NOT EXISTS signals_sent_at_idx
     ON signals (signal_sent_at DESC);
+
+------------------------------------------------------------------------------
+-- §6.4 positions — simulated lifecycle of each sent signal (Phase 6 tracker).
+--   exit_reason ∈ {STOP, TRAIL, TIME_EXPIRY}; pnl_pct is blended post-T1.
+--   signals.status gains CLOSED_TRAIL / CLOSED_TIME_EXPIRY (plain TEXT, no
+--   CHECK constraint) alongside PENDING_ENTRY/ACTIVE/CLOSED_STOP/EXPIRED.
+------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS positions (
+    signal_id       BIGINT PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
+    entry_filled_at DATE,
+    t1_hit_at       DATE,
+    exit_at         DATE,
+    exit_price      NUMERIC,
+    exit_reason     TEXT,                 -- 'STOP' | 'TRAIL' | 'TIME_EXPIRY'
+    pnl_pct         NUMERIC,
+    max_favorable   NUMERIC,
+    max_adverse     NUMERIC,
+    days_held       INT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS positions_exit_at_idx
+    ON positions (exit_at DESC);
