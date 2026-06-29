@@ -47,25 +47,35 @@ source of truth.
 
 ## 2. Current state
 
-**Last completed:** Phase 5 — Signal Generation with tiering (committed and
-pushed to origin/main). Validated end-to-end on real data (`--as-of
-2026-05-29`): ranker → tiering → confirmations → levels → formatter → run
-summary all execute without error. IMPORTANT: emits 0 signals on the current
-backfill because ~94% of filings are dropped at Phase 3 `parser_confidence`
-(low/failed), leaving a 4-row cohort with compressed z-scores (top 0.62σ, all
-below the 2.0σ SKIP floor). The send/persist and per-signal-format path is
-therefore NOT yet exercised against a real fired signal. Also note:
-`PORTFOLIO_VALUE_INR` in `config.py` may still be the placeholder — set to the
-real figure before any live run, as it drives position sizing, C4 liquidity,
-and allocation math.
+**Last completed:** Phase 6 — Position Tracker (commit `a46c812`, pushed).
+`src/pipeline/tracker.py` replays each sent signal against real daily OHLC
+(entry breakout → 50% at T1 → trail remaining 50% on the 20-EMA → blended P&L),
+writes the `positions` table, updates `signals.status`, and sends a daily
+summary (open count, today's/MTD P&L, hit rate over last 50). Verified on real
+data (AIAENG replay: entry 2026-05-29, T1 booked 2026-06-22, ACTIVE trailing,
++8.8% blended). ⚠️ **DEPLOY STEP PENDING:** `migrations/phase6_alter.sql` is
+NOT yet applied to Supabase — apply it in the SQL Editor before the
+`track-positions` cron runs, or the job errors on the missing `positions` table.
 
-**Migrations:** both `migrations/phase4_alter.sql` AND
-`migrations/phase5_alter.sql` are applied to Supabase (phase5 adds the
-`signals` table). **Phase 4 ranker bugfix (commit `fa0f118`):**
-`_select_cohort` previously anchored its 7-day window to `datetime.now()`
-instead of `run_date`, so `--as-of` replays silently queried "now"; fixed
-with a `run_date`-anchored window (IST day bounds, both lower+upper) plus a
-regression test.
+**Parser-confidence (the old ~94% drop):** resolved by **Fix B** (commit
+`7d3c25a`) — `column_period` validation + a consolidated/standalone divergence
+guard. Gemini now recovers Q4 "year ended" filings (REFEX/MARKSANS verified).
+The backlog re-enrichment is a multi-day grind throttled by Gemini free-tier
+429s; a **TEMPORARY** `reparse-backfill` workflow (commit `ff05e28`, daily
+03:30 UTC) drains it — **delete that workflow** once `enrich_eod.py --reparse
+--window-days 60` reports 0 candidates. BSE filings with expired `AttachLive`
+PDF URLs 404 and stay failed (accepted as permanent data loss).
+
+**Signals status:** plumbing (generate→Telegram→persist) verified end-to-end.
+The current backfill contains NO genuine ≥2.0σ event (max 1.22σ), so no real
+signal has fired — that's expected; real signals arrive organically via the
+daily cron. `PORTFOLIO_VALUE_INR` is set to the real ₹1 lakh (commit `c497081`).
+
+**Migrations:** `phase4_alter.sql` + `phase5_alter.sql` are applied;
+`phase6_alter.sql` (positions table) is **NOT yet applied** (see above).
+**Phase 4 fixes:** `_select_cohort` is now `run_date`-anchored (`fa0f118`) AND
+paginated past the 1000-row PostgREST cap (`39cba68`) so dense result-weeks
+aren't truncated.
 
 **Phases complete (verify by reading code, not just trusting this file):**
 
@@ -77,16 +87,12 @@ regression test.
 | 3 | Enrichment — Gemini parser, Screener cache, yfinance, 5 PEAD metrics | BRD §8 Phase 3 |
 | 4 | Scoring, hard filters, cross-source dedup, top-25 ranking | BRD §8 Phase 4 |
 | 5 | Signal generation with tiering, confirmations, position sizing | BRD §8 Phase 5 |
+| 6 | Position tracker — lifecycle sim, P&L/hit-rate, trailing stop | BRD §8 Phase 6 |
 
-**Phase 3 historical backfill** (215 filings) was run in a separate terminal
-during the Phase 4 build. Status: check `metrics` table row count vs. `filings`
-in the 14-day window.
-
-**Next:** Investigate the Phase 3 parser-confidence rejection rate (~94% of
-filings dropped at low/failed). This blocks the system from producing signals
-and must be resolved BEFORE Phase 6 — there is no value in a position tracker
-when nothing generates signals. Do NOT start Phase 6 until the user explicitly
-requests it.
+**Next:** (1) Apply `phase6_alter.sql` to Supabase. (2) Let the
+`reparse-backfill` workflow drain the late-May backlog, then delete it. (3) The
+system is feature-complete per the BRD — ongoing operation is the daily crons
+(poll → enrich → rank → signals → track) producing organic signals.
 
 ---
 
@@ -168,23 +174,21 @@ If any of those fail, fix the environment before doing any work.
 
 ---
 
-## 7. What's next — Phase 5 hints (DO NOT BUILD YET)
+## 7. What's next — all 7 BRD phases are built
 
-When the user explicitly opens Phase 5, the relevant BRD sections are:
+Phases 0–6 are implemented (see the §2 table). There is no Phase 7 in BRD §8;
+the system is feature-complete per the BRD. Remaining work is operational, not
+phase-building:
 
-- [BRD §3.5](BRD.md#35-signal-generation-layer-t1-close) — FR-5.1 to FR-5.7
-  (entry/stop/T1, tiering matrix, confirmation checklist, position sizing,
-  concentration limits).
-- [BRD §6.3](BRD.md#63-signals-table) — `signals` table schema.
-- [BRD §8 Phase 5](BRD.md#phase-5--signal-generation-with-tiering) — scope +
-  acceptance criteria.
+- **Apply `migrations/phase6_alter.sql`** to Supabase (positions table) — the
+  `track-positions` cron needs it.
+- **Drain + delete the temporary `reparse-backfill` workflow** once the late-May
+  backlog clears (`enrich_eod.py --reparse --window-days 60` → 0 candidates).
+- **Let the daily crons run** (poll → enrich → rank → signals → track) and watch
+  for the first organic ≥2.0σ signal to fire and flow into the tracker.
 
-Phase 4 already wrote the `rankings` table — Phase 5's signal generator reads
-that, applies tiering + confirmations, and writes `signals`. Phase 5 also adds
-the `tiering.py` and `signaler.py` modules under `src/pipeline/`.
-
-Until the user explicitly says "implement Phase 5", do not write any Phase 5
-code — not even scaffolding, not even tests. This is non-negotiable per BRD §0.
+Any genuinely new feature beyond BRD §8 is out of scope until the user asks for
+it — flag, don't pre-build (BRD §0).
 
 ---
 
