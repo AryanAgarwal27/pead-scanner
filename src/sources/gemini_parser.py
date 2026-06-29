@@ -94,9 +94,22 @@ class GeminiResponse(BaseModel):
         ...,
         description=(
             "EXACT label of the COLUMN you read the headline numbers from, as printed at the top of "
-            "that column. Must refer to a single QUARTER, not a year. "
+            "that column. Should refer to a single QUARTER, not a year. "
             "Examples: 'Quarter ended March 31, 2026 (Audited)', '3 months ended 31.03.2026', "
-            "'Quarter ended 30 June 2025'."
+            "'Quarter ended 30 June 2025'. May be a bare date like '31.03.2026 (Audited)' when the "
+            "quarter/year distinction is in the statement title or a sub-header."
+        ),
+    )
+    column_period: Literal["quarter", "half_year", "year"] = Field(
+        ...,
+        description=(
+            "The PERIOD the column you extracted covers — report what you ACTUALLY read: "
+            "'quarter' = a single 3-month column ('Quarter ended', '3 months ended'); "
+            "'half_year' = a 6-month column; 'year' = a 12-month / year-to-date / annual column "
+            "('Year ended'). Indian annual (Q4) filings show BOTH a quarter column AND a year "
+            "column with the SAME 31-March end-date — you MUST pick the QUARTER column and report "
+            "'quarter'. Report 'year' or 'half_year' ONLY if the filing has no single-quarter "
+            "column at all."
         ),
     )
 
@@ -148,6 +161,32 @@ class GeminiResponse(BaseModel):
         ),
     )
 
+    # --- Cross-check fields for the standalone-vs-consolidated divergence guard.
+    # These are reported for BOTH bases whenever each table exists, independent of
+    # which basis the headline numbers above came from. Python compares them to
+    # detect a basis mismatch (e.g. headline read from STANDALONE while a
+    # materially different CONSOLIDATED table exists) and downgrades confidence.
+    consolidated_pat_raw: float | None = Field(
+        default=None,
+        description=(
+            "Profit After Tax for the SELECTED QUARTER read from the CONSOLIDATED results table, "
+            "EXACTLY as printed (same unit as `unit`). Null ONLY if the PDF contains NO "
+            "consolidated results table. Report this whenever a consolidated table exists — even "
+            "if your headline numbers came from the standalone table — it is used for an automated "
+            "consistency cross-check."
+        ),
+    )
+    standalone_pat_raw: float | None = Field(
+        default=None,
+        description=(
+            "Profit After Tax for the SELECTED QUARTER read from the STANDALONE results table, "
+            "EXACTLY as printed (same unit as `unit`). Null ONLY if the PDF contains NO standalone "
+            "results table. Report this whenever a standalone table exists — even if your headline "
+            "numbers came from the consolidated table — it is used for an automated consistency "
+            "cross-check."
+        ),
+    )
+
     # --- Single unit declaration — applies to all monetary raw fields above
     unit: Literal["crores", "lakhs", "millions", "rupees"] = Field(
         ...,
@@ -155,8 +194,8 @@ class GeminiResponse(BaseModel):
             "The unit of measurement printed at the top of the financial results table — usually "
             "in parentheses or in a sub-heading. Look for '(Rs. in Lakhs)', '(Rs. in Crores)', "
             "'(Rs. in Million)', '(₹ in Lakhs)'. Pick exactly one. This applies to revenue_raw, "
-            "pat_raw, operating_profit_raw, revenue_yoy_raw, and pat_yoy_raw. EPS is NEVER in these "
-            "units — it is always ₹ per share."
+            "pat_raw, operating_profit_raw, revenue_yoy_raw, pat_yoy_raw, consolidated_pat_raw, and "
+            "standalone_pat_raw. EPS is NEVER in these units — it is always ₹ per share."
         ),
     )
 
@@ -234,18 +273,39 @@ ABSOLUTE RULES (violation = invalid response):
   5. If the cell value cannot be located, return null. NEVER guess.
 
 COLUMN SELECTION:
-  Indian quarterly result tables typically show 5 columns:
+  Indian results tables typically show up to 5 columns:
     [Quarter ended <recent>] [Quarter ended <prev qtr>] [Quarter ended <yoy>]
     [Year ended <recent>] [Year ended <prev yoy>]
-  You must pick the FIRST column (Quarter ended <recent>). Report its exact
-  printed label in `column_label`. If a Year-ended column has identical
-  end-dates (true for Q4 filings where year-end == Q4-end), still pick the
-  Quarter column — its header will say 'Quarter' or '3 months', not 'Year'.
+  ALWAYS pick the single most-recent QUARTER (3-month) column. Report its exact
+  printed label in `column_label` and set `column_period='quarter'`.
+
+  CRITICAL — annual / year-end (Q4) filings: the STATEMENT TITLE often reads
+  "for the Quarter and Year ended 31 March 2026", or even just "for the YEAR
+  ENDED 31 March 2026" — but the table STILL contains a 3-month QUARTER column
+  next to the 12-month year column (both dated 31 March). DO NOT be misled by
+  the title or by a year-ended heading: locate and extract the QUARTER column.
+  Because the quarter and year columns share the same 31-March end-date for Q4,
+  distinguish them by the column sub-header ('3 Months ended' / 'Quarter ended'
+  vs 'Year ended' / 'Year to date') or by position (quarter columns come before
+  year columns). Set column_period to reflect the column you actually used.
+
+  Only if the filing GENUINELY has no single-quarter column (e.g. a standalone
+  annual P&L that prints only 12-month figures) should you extract the year (or
+  half-year) column and set column_period='year' (or 'half_year') accordingly.
 
 CONSOLIDATED vs STANDALONE:
-  If the PDF contains BOTH a standalone results table and a consolidated
-  results table, PREFER the CONSOLIDATED one and set is_consolidated=true.
-  If only one is shown, use it and set is_consolidated accordingly.
+  SCAN THE WHOLE DOCUMENT before choosing. Filings frequently print the
+  STANDALONE results table first and the CONSOLIDATED table later (or as a
+  separate statement). If a CONSOLIDATED results table exists ANYWHERE in the
+  PDF, you MUST extract from it and set is_consolidated=true — even when the
+  standalone table appeared first. Fall back to standalone
+  (is_consolidated=false) ONLY if no consolidated table exists in the document.
+
+  CROSS-CHECK (always): report `consolidated_pat_raw` and `standalone_pat_raw`
+  for the selected quarter from EACH basis's table whenever that table is
+  present, regardless of which basis you used for the headline numbers. Leave a
+  field null ONLY if that basis's table does not exist in the PDF. These feed an
+  automated standalone-vs-consolidated consistency check.
 
 UNIT FIELD:
   Indian filings always state the unit (it's a SEBI requirement). Look near
@@ -499,7 +559,9 @@ def _call_gemini(
         gem = GeminiResponse.model_validate_json(response.text or "")
 
     # Hard validation: did Gemini pick a quarter column for the right date?
-    _validate_columns(gem.source_table, gem.column_label, expected_quarter)
+    _validate_columns(
+        gem.column_period, gem.source_table, gem.column_label, expected_quarter
+    )
 
     return _to_parsed_filing(gem, parser_tag)
 
@@ -517,7 +579,6 @@ _MONTH_NAMES = {
     12: ("December", "Dec"),
 }
 _QUARTER_RE = re.compile(r"Q([1-4])-FY(\d{2})")
-_QUARTER_WORD_RE = re.compile(r"quarter|3\s*months|three\s*months", re.IGNORECASE)
 
 
 def _quarter_to_end_date(quarter_label: str) -> date:
@@ -564,15 +625,28 @@ def _ordinal_suffix(n: int) -> str:
     return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
 
 
-def _validate_columns(source_table: str, column_label: str, expected_quarter: str) -> None:
-    """Raise _ColumnValidationFailure if the model didn't pick a quarter column
-    for the expected end-date."""
-    combined = f"{source_table} || {column_label}"
-    if not _QUARTER_WORD_RE.search(combined):
+def _validate_columns(
+    column_period: str, source_table: str, column_label: str, expected_quarter: str
+) -> None:
+    """Raise _ColumnValidationFailure if the model didn't extract a single
+    QUARTER column for the expected quarter-end date.
+
+    Quarter-vs-year is validated on the model's explicit `column_period`
+    declaration rather than substring-matching the literal word 'quarter' in the
+    free-text labels: annual (Q4) filings legitimately carry a quarter column
+    inside a 'year ended' statement, and their column labels are often bare
+    dates ('31.03.2026 (Audited)') with no 'quarter' token — the old word-match
+    rejected those valid extractions. A column_period of 'year'/'half_year'
+    means no quarter figure was read, so the filing is (correctly) rejected and
+    demoted to the next tier / regex.
+    """
+    if column_period != "quarter":
         raise _ColumnValidationFailure(
-            f"neither source_table nor column_label contains 'quarter' / '3 months' "
-            f"(got source_table={source_table!r}, column_label={column_label!r})"
+            f"model reports column_period={column_period!r}, not a single-quarter column — "
+            f"no quarter figure extracted "
+            f"(source_table={source_table!r}, column_label={column_label!r})"
         )
+    combined = f"{source_table} || {column_label}"
     lower = combined.lower()
     expected = _expected_date_strings(expected_quarter)
     if not any(v.lower() in lower for v in expected):
@@ -600,6 +674,49 @@ _MAX_REVENUE_CR = 1e7        # ₹10 lakh crore — larger than any single India
 _MAX_PAT_CR = 1e7
 _MAX_ABS_EPS = 1e4
 _OPM_MIN, _OPM_MAX = -100.0, 100.0
+
+# Consolidated-vs-standalone divergence guard (Fix B).
+# A recovered Q4 'year ended' filing must not pass a signal on STANDALONE numbers
+# when a materially-different CONSOLIDATED table exists in the same PDF: PEAD
+# surprise compares the filing's PAT against (consolidated-preferred) history, so
+# a standalone PAT yields a bogus surprise. When the model reports BOTH bases'
+# PAT and the headline basis is NOT confirmed consolidated, a relative gap beyond
+# this fraction downgrades confidence to 'low' (excluded by Phase 4's
+# {high,medium} floor). 0.25 = 25%. Identical bases (single-entity companies)
+# fall below the threshold and are left untouched.
+_CONSOLIDATED_DIVERGENCE_THRESHOLD = 0.25
+
+
+def _consolidated_divergence_note(gem: GeminiResponse) -> str | None:
+    """Return a downgrade reason if the parse used STANDALONE numbers while a
+    materially-divergent CONSOLIDATED PAT exists in the same filing, else None.
+
+    Guard conditions (all must hold):
+      1. The headline basis is NOT confirmed consolidated (is_consolidated is
+         False or None) — i.e. we may have passed standalone numbers.
+      2. Both the consolidated AND standalone PAT were reported (a comparison
+         exists). Raw values share `unit`, so they're compared as-is.
+      3. Their relative gap exceeds _CONSOLIDATED_DIVERGENCE_THRESHOLD.
+
+    Identical/near-identical bases (single-entity companies, or a consolidated
+    extraction we trust) fall through to None and are left untouched.
+    """
+    cons = gem.consolidated_pat_raw
+    std = gem.standalone_pat_raw
+    if cons is None or std is None:
+        return None
+    if gem.is_consolidated is True:
+        return None  # headline came from the consolidated basis — the right one
+    denom = max(abs(cons), abs(std))
+    if denom == 0:
+        return None
+    divergence = abs(cons - std) / denom
+    if divergence <= _CONSOLIDATED_DIVERGENCE_THRESHOLD:
+        return None
+    return (
+        f"standalone PAT {std} vs consolidated PAT {cons} diverge "
+        f"{divergence * 100:.0f}% (used standalone basis)"
+    )
 
 
 def _to_parsed_filing(gem: GeminiResponse, parser_tag: str) -> ParsedFiling:
@@ -635,6 +752,17 @@ def _to_parsed_filing(gem: GeminiResponse, parser_tag: str) -> ParsedFiling:
         )
         confidence = "low"
         notes = f"{notes or ''} [bounded:{','.join(out_of_range)}]".strip()
+
+    # Consolidated-vs-standalone divergence guard (Fix B): if we passed STANDALONE
+    # numbers while a materially-divergent CONSOLIDATED PAT exists in the same
+    # filing, downgrade so the row can't clear Phase 4's confidence floor.
+    div_note = _consolidated_divergence_note(gem)
+    if div_note and confidence in ("high", "medium"):
+        log.warning(
+            f"[{parser_tag}] consolidated-divergence downgrade ({div_note}); confidence -> low"
+        )
+        confidence = "low"
+        notes = f"{notes or ''} [cons-divergence: {div_note}]".strip()
 
     return ParsedFiling(
         revenue_cr=revenue_cr,
