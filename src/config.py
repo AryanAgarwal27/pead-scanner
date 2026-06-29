@@ -141,7 +141,7 @@ CONF_CORPORATE_ACTION_WINDOW_DAYS = 5     # Phase 5: C5 — no split/bonus/div e
 # Position sizing (BRD §3.5 FR-5.6).
 # ---------------------------------------------------------------------------
 DEFAULT_RISK_PER_TRADE_PCT = 0.01         # Phase 5: R = 1% of portfolio per trade
-PORTFOLIO_VALUE_INR = 1_000_000           # Phase 5 — update before going live
+PORTFOLIO_VALUE_INR = 100_000             # real capital base ₹1 lakh — set by owner 2026-06-29
 
 
 # ---------------------------------------------------------------------------
